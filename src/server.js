@@ -412,11 +412,9 @@ app.get('/ping', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ==========================================
-// 7. START SERVER
-// ==========================================
+// START SERVER
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📧 Email configured for: ${process.env.EMAIL_USER}`);
-  console.log(`⏰ Recurring expense job scheduled for 00:05 IST daily.`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Email configured for: ${process.env.EMAIL_USER}`);
+  console.log(`Recurring expense job scheduled for 00:05 IST daily.`);
 });
