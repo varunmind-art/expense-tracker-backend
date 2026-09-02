@@ -407,6 +407,7 @@ setTimeout(processRecurringExpenses, 10000);
 // ==========================================
 // 6. KEEP-ALIVE PING ENDPOINT
 // ==========================================
+// KEEP-ALIVE PING ENDPOINT
 app.get('/ping', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
