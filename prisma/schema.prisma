@@ -1,0 +1,83 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  password      String    // Hashed
+  name          String?
+  createdAt     DateTime  @default(now())
+  
+  categories    Category[]
+  expenses      Expense[]
+  budgets       Budget[]
+  recurringRules RecurringRule[]
+}
+
+model Category {
+  id            String    @id @default(cuid())
+  name          String
+  icon          String?   // Emoji or icon name (e.g., "🍕", "🚗")
+  color         String?   // Hex color code
+  isDefault     Boolean   @default(false) // Pre-seeded categories
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  expenses      Expense[]
+  budgets       Budget[]
+  recurringRules RecurringRule[]
+
+  @@unique([userId, name]) // One user can't have duplicate category names
+}
+
+model Expense {
+  id            String    @id @default(cuid())
+  amount        Decimal   @db.Decimal(10, 2)
+  date          DateTime  @default(now())
+  note          String?
+  receiptUrl    String?   // Cloudinary URL
+  isRecurring   Boolean   @default(false)
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categoryId    String
+  category      Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model Budget {
+  id            String    @id @default(cuid())
+  amount        Decimal   @db.Decimal(10, 2)
+  period        String    // "MONTHLY" or "WEEKLY"
+  startDate     DateTime  @default(now())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categoryId    String
+  category      Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, categoryId, period]) // One budget per category per period
+}
+
+model RecurringRule {
+  id            String    @id @default(cuid())
+  description   String
+  amount        Decimal   @db.Decimal(10, 2)
+  frequency     String    // "DAILY", "WEEKLY", "MONTHLY", "YEARLY"
+  dayOfMonth    Int?      // For MONTHLY (e.g., 1 for 1st of month)
+  dayOfWeek     Int?      // For WEEKLY (0=Sunday, 6=Saturday)
+  nextExecution DateTime  // When to trigger next
+  isActive      Boolean   @default(true)
+  
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categoryId    String
+  category      Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+}
