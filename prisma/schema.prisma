@@ -14,7 +14,7 @@ model User {
   password      String    // Hashed
   name          String?
   createdAt     DateTime  @default(now())
-  
+  gmailRefreshToken String?    // store encrypted refresh token
   categories    Category[]
   expenses      Expense[]
   budgets       Budget[]

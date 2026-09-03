@@ -7,6 +7,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const cron = require('node-cron');
+const { google } = require('googleapis'); // Added for Gmail
 
 const prisma = new PrismaClient();
 const app = express();
@@ -48,7 +49,7 @@ const DEFAULT_CATEGORIES = [
   { name: 'Healthcare', icon: '🏥', color: '#D4A5A5' },
   { name: 'Education', icon: '📚', color: '#9B59B6' },
   { name: 'Rent', icon: '🏠', color: '#E67E22' },
-  { name: 'Salary', icon: '💰', color: '#2ECC71' }, // Added for income tracking context
+  { name: 'Salary', icon: '💰', color: '#2ECC71' },
   { name: 'Other', icon: '📌', color: '#95A5A6' },
 ];
 
@@ -80,7 +81,6 @@ app.post('/api/auth/register', async (req, res) => {
       data: { email, password: hashedPassword, name },
     });
 
-    // Seed default categories
     await seedCategories(user.id);
 
     const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
@@ -118,7 +118,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) return res.status(404).json({ error: 'No user found with this email.' });
 
-    // Generate a reset token (short-lived)
     const resetToken = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
     const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
 
@@ -136,7 +135,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   }
 });
 
-// Reset Password (using the token)
+// Reset Password
 app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const { token, newPassword } = req.body;
@@ -281,7 +280,7 @@ app.post('/api/categories', authenticateToken, async (req, res) => {
 app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
   try {
     await prisma.category.delete({
-      where: { id: req.params.id, userId: req.user.id, isDefault: false }, // Prevent deleting default categories
+      where: { id: req.params.id, userId: req.user.id, isDefault: false },
     });
     res.json({ message: 'Category deleted.' });
   } catch (error) {
@@ -336,7 +335,7 @@ app.delete('/api/budgets/:id', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 5. RECURRING EXPENSES CRON JOB (Runs daily at midnight IST)
+// 5. RECURRING EXPENSES CRON JOB
 // ==========================================
 const processRecurringExpenses = async () => {
   console.log('🔄 Running recurring expense job...');
@@ -353,7 +352,6 @@ const processRecurringExpenses = async () => {
 
   for (const rule of rules) {
     try {
-      // Create the expense
       await prisma.expense.create({
         data: {
           amount: rule.amount,
@@ -365,7 +363,6 @@ const processRecurringExpenses = async () => {
         },
       });
 
-      // Calculate next execution date
       let nextExec = new Date(today);
       if (rule.frequency === 'DAILY') {
         nextExec.setDate(today.getDate() + 1);
@@ -375,16 +372,14 @@ const processRecurringExpenses = async () => {
         nextExec.setMonth(today.getMonth() + 1);
         if (rule.dayOfMonth) {
           nextExec.setDate(rule.dayOfMonth);
-          // Handle edge case: if day doesn't exist in next month, set to last day
           if (nextExec.getDate() !== rule.dayOfMonth) {
-            nextExec.setDate(0); // last day of previous month
+            nextExec.setDate(0);
           }
         }
       } else if (rule.frequency === 'YEARLY') {
         nextExec.setFullYear(today.getFullYear() + 1);
       }
 
-      // Update the rule
       await prisma.recurringRule.update({
         where: { id: rule.id },
         data: { nextExecution: nextExec },
@@ -397,22 +392,75 @@ const processRecurringExpenses = async () => {
   }
 };
 
-// Schedule the job: runs at 00:05 AM IST (18:30 UTC) every day
-// Note: node-cron uses UTC time. 18:30 UTC = 00:00 IST.
 cron.schedule('30 18 * * *', processRecurringExpenses);
-
-// Also run on server startup to catch any missed entries
 setTimeout(processRecurringExpenses, 10000);
+
+// ==========================================
+// 6. GMAIL INTEGRATION
+// ==========================================
+
+// OAuth2 client
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
+
+// Initiate Gmail OAuth
+app.get('/api/auth/gmail', authenticateToken, (req, res) => {
+  const userId = req.user.id;
+  const authUrl = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: ['https://www.googleapis.com/auth/gmail.readonly'],
+    prompt: 'consent',
+    state: userId,
+  });
+  res.json({ authUrl });
+});
+
+// Gmail OAuth callback
+app.get('/api/auth/gmail/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) {
+    return res.status(400).send('Missing code or user ID');
+  }
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    await prisma.user.update({
+      where: { id: state },
+      data: { gmailRefreshToken: tokens.refresh_token },
+    });
+    res.send('Gmail connected successfully! You can close this tab.');
+  } catch (error) {
+    console.error('Gmail OAuth error:', error);
+    res.status(500).send('Failed to connect Gmail.');
+  }
+});
+
+// Check Gmail connection status (NEW)
+app.get('/api/auth/gmail/status', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { gmailRefreshToken: true }
+    });
+    res.json({ connected: !!user?.gmailRefreshToken });
+  } catch (error) {
+    console.error('Gmail status error:', error);
+    res.status(500).json({ error: 'Failed to check Gmail status' });
+  }
+});
 
 // ==========================================
 // 6. KEEP-ALIVE PING ENDPOINT
 // ==========================================
-// KEEP-ALIVE PING ENDPOINT
 app.get('/ping', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// START SERVER
+// ==========================================
+// 7. START SERVER
+// ==========================================
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Email configured for: ${process.env.EMAIL_USER}`);
