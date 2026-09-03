@@ -409,11 +409,14 @@ const oauth2Client = new google.auth.OAuth2(
 // Initiate Gmail OAuth
 app.get('/api/auth/gmail', authenticateToken, (req, res) => {
   const userId = req.user.id;
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+  console.log('🔍 GOOGLE_REDIRECT_URI:', redirectUri); // Add this log
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: ['https://www.googleapis.com/auth/gmail.readonly'],
     prompt: 'consent',
     state: userId,
+    redirect_uri: redirectUri, // Explicitly pass it
   });
   res.json({ authUrl });
 });
