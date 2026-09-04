@@ -402,7 +402,7 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // ==========================================
-// Improved YES BANK email parser (with fallbacks)
+// Improved YES BANK email parser
 // ==========================================
 const parseYesBankEmail = (subject, body) => {
   const result = { amount: null, merchant: null };
@@ -436,7 +436,7 @@ const parseYesBankEmail = (subject, body) => {
 };
 
 // ==========================================
-// processGmailReceipts – with debug logging and fallback for YES BANK
+// processGmailReceipts – Updated with better Amazon parsing
 // ==========================================
 const processGmailReceipts = async (userId) => {
   console.log(`📧 Processing Gmail receipts for user ${userId}`);
@@ -466,11 +466,11 @@ const processGmailReceipts = async (userId) => {
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-  // Search query – include YES BANK senders
+  // Expanded search query – include amazonpay.in
   const now = new Date();
   const sevenDaysAgo = new Date(now);
   sevenDaysAgo.setDate(now.getDate() - 7);
-  const query = `from:(amazon.in OR swiggy.in OR zomato.com OR uber.com OR flipkart.com OR yesbank.in OR "syes.bank.in" OR "yes.bank.in" OR "yesbank") after:${Math.floor(sevenDaysAgo.getTime() / 1000)}`;
+  const query = `from:(amazon.in OR amazonpay.in OR swiggy.in OR zomato.com OR uber.com OR flipkart.com OR yesbank.in OR "syes.bank.in" OR "yes.bank.in" OR "yesbank") after:${Math.floor(sevenDaysAgo.getTime() / 1000)}`;
 
   console.log(`🔍 Searching emails with query: "${query}"`);
   
@@ -509,7 +509,8 @@ const processGmailReceipts = async (userId) => {
       for (const header of headers) {
         if (header.name === 'Subject') subject = header.value;
       }
-      // Get plain text body – try to find text/plain part
+      
+      // Improved body extraction
       if (payload.parts) {
         for (const part of payload.parts) {
           if (part.mimeType === 'text/plain') {
@@ -520,12 +521,11 @@ const processGmailReceipts = async (userId) => {
       } else if (payload.body && payload.body.data) {
         body = Buffer.from(payload.body.data, 'base64').toString('utf8');
       }
-      // If body is empty, try to get HTML and strip tags (fallback)
+      // Fallback: strip HTML if plain text not found
       if (!body && payload.parts) {
         for (const part of payload.parts) {
           if (part.mimeType === 'text/html') {
             const html = Buffer.from(part.body.data, 'base64').toString('utf8');
-            // Very basic stripping – just to get text
             body = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
             break;
           }
@@ -541,13 +541,8 @@ const processGmailReceipts = async (userId) => {
         const parsed = parseYesBankEmail(subject, body);
         console.log(`📊 Parsed YES BANK: amount=${parsed.amount}, merchant=${parsed.merchant}`);
         if (parsed.amount && parsed.merchant) {
-          // Check for duplicate
           const existing = await prisma.pendingImport.findFirst({
-            where: {
-              userId,
-              sourceId: msg.id,
-              source: 'GMAIL_YESBANK',
-            },
+            where: { userId, sourceId: msg.id, source: 'GMAIL_YESBANK' },
           });
           if (existing) {
             console.log(`⏭️ Duplicate pending import for email ${msg.id}`);
@@ -566,15 +561,21 @@ const processGmailReceipts = async (userId) => {
             },
           });
           console.log(`📥 Added pending import: ₹${parsed.amount} from ${parsed.merchant}`);
-          continue; // skip regular expense creation
+          continue;
         } else {
-          console.log(`⏭️ Could not parse amount/merchant from YES BANK email ${msg.id}`);
+          console.log(`⏭️ Could not parse YES BANK email ${msg.id}`);
+          continue;
         }
       }
 
-      // --- For other senders (Amazon, Swiggy, etc.) – create expense directly ---
-      // Extract amount (₹)
-      const amountMatch = body.match(/₹\s*([\d,]+(?:\.\d{2})?)/);
+      // --- Amazon / Other merchants: extract amount and merchant ---
+      let amountMatch = body.match(/(?:Rs|₹|INR)\s*([\d,]+(?:\.\d{2})?)/i);
+      if (!amountMatch) {
+        amountMatch = body.match(/([\d,]+\.\d{2})\s*(?:was paid|paid|spent)/i);
+      }
+      if (!amountMatch) {
+        amountMatch = subject.match(/(?:Rs|₹|INR)\s*([\d,]+(?:\.\d{2})?)/i);
+      }
       if (!amountMatch) {
         console.log(`⏭️ No amount found in email ${msg.id}`);
         continue;
@@ -584,13 +585,13 @@ const processGmailReceipts = async (userId) => {
 
       // Determine merchant
       let merchant = 'Unknown';
-      if (sender.includes('amazon')) merchant = 'Amazon';
+      if (sender.includes('amazon') || sender.includes('amazonpay')) merchant = 'Amazon';
       else if (sender.includes('swiggy')) merchant = 'Swiggy';
       else if (sender.includes('zomato')) merchant = 'Zomato';
       else if (sender.includes('uber')) merchant = 'Uber';
       else if (sender.includes('flipkart')) merchant = 'Flipkart';
 
-      // Prevent duplicates
+      // Check for duplicate expense
       const existing = await prisma.expense.findFirst({
         where: {
           userId,
@@ -743,18 +744,14 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
     if (!pending) {
       return res.status(404).json({ error: 'Pending import not found or already processed.' });
     }
-
-    // Determine final categoryId
     let finalCategoryId = categoryId || pending.categoryId;
     if (!finalCategoryId) {
-      // Try to find the user's "Other" category
       const defaultCategory = await prisma.category.findFirst({
         where: { userId: req.user.id, name: 'Other' },
       });
       if (defaultCategory) {
         finalCategoryId = defaultCategory.id;
       } else {
-        // Fallback to any category
         const anyCategory = await prisma.category.findFirst({
           where: { userId: req.user.id },
         });
@@ -765,7 +762,6 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
         }
       }
     }
-
     const expense = await prisma.expense.create({
       data: {
         amount: pending.amount,
@@ -776,12 +772,10 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
         isRecurring: false,
       },
     });
-
     await prisma.pendingImport.update({
       where: { id: pending.id },
       data: { status: 'confirmed' },
     });
-
     res.json({ message: 'Expense created from pending import.', expense });
   } catch (error) {
     console.error('Confirm error:', error);
