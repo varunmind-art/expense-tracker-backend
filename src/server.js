@@ -66,8 +66,6 @@ const seedCategories = async (userId) => {
 // ==========================================
 // 1. AUTH ROUTES
 // ==========================================
-
-// Register
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, name } = req.body;
@@ -91,7 +89,6 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// Login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -111,7 +108,6 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Forgot Password
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
@@ -135,7 +131,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   }
 });
 
-// Reset Password
 app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const { token, newPassword } = req.body;
@@ -407,24 +402,24 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // ==========================================
-// Helper: Parse YES BANK emails
+// Improved YES BANK email parser
 // ==========================================
 const parseYesBankEmail = (subject, body) => {
   const result = { amount: null, merchant: null };
-  // Extract amount – look for ₹ symbol
-  const amountMatch = body.match(/₹\s*([\d,]+(?:\.\d{2})?)/);
+  // Extract amount – support "INR" or "₹"
+  const amountMatch = body.match(/(?:INR|₹)\s*([\d,]+(?:\.\d{2})?)/i);
   if (amountMatch) {
     result.amount = parseFloat(amountMatch[1].replace(/,/g, ''));
   }
-  // Extract merchant – look for "at" or "at " followed by text
-  const merchantMatch = body.match(/at\s+([A-Za-z0-9\s\.\-]+)/i);
+  // Extract merchant – look for "at " followed by text until " on " or " for " or end of line
+  const merchantMatch = body.match(/at\s+([A-Za-z0-9\s\.\-_]+?)(?:\s+on\s+|\s+for\s+|\s*$)/i);
   if (merchantMatch) {
     result.merchant = merchantMatch[1].trim();
   }
-  // If not found in body, try subject
+  // If not found, try alternate: after "at " until a comma or newline
   if (!result.merchant) {
-    const subjectMatch = subject.match(/at\s+([A-Za-z0-9\s\.\-]+)/i);
-    if (subjectMatch) result.merchant = subjectMatch[1].trim();
+    const altMatch = body.match(/at\s+([^\n,]+)/i);
+    if (altMatch) result.merchant = altMatch[1].trim();
   }
   return result;
 };
@@ -460,11 +455,11 @@ const processGmailReceipts = async (userId) => {
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-  // Search for recent emails (last 7 days) – include YES BANK
+  // Search query – include YES BANK senders
   const now = new Date();
   const sevenDaysAgo = new Date(now);
   sevenDaysAgo.setDate(now.getDate() - 7);
-  const query = `from:(amazon.in OR swiggy.in OR zomato.com OR uber.com OR flipkart.com OR yesbank.in) after:${Math.floor(sevenDaysAgo.getTime() / 1000)}`;
+  const query = `from:(amazon.in OR swiggy.in OR zomato.com OR uber.com OR flipkart.com OR yesbank.in OR "syes.bank.in" OR "yes.bank.in" OR "yesbank") after:${Math.floor(sevenDaysAgo.getTime() / 1000)}`;
 
   console.log(`🔍 Searching emails with query: "${query}"`);
   
@@ -518,8 +513,9 @@ const processGmailReceipts = async (userId) => {
       const sender = headers.find(h => h.name === 'From')?.value || '';
 
       // --- Check if it's a YES BANK alert ---
-      if (sender.includes('YES BANK') || sender.includes('yesbank')) {
+      if (sender.includes('YES BANK') || sender.includes('yesbank') || sender.includes('syes.bank.in')) {
         const parsed = parseYesBankEmail(subject, body);
+        console.log(`📊 Parsed YES BANK: amount=${parsed.amount}, merchant=${parsed.merchant}`);
         if (parsed.amount && parsed.merchant) {
           // Check for duplicate
           const existing = await prisma.pendingImport.findFirst({
@@ -547,11 +543,13 @@ const processGmailReceipts = async (userId) => {
           });
           console.log(`📥 Added pending import: ₹${parsed.amount} from ${parsed.merchant}`);
           continue; // skip regular expense creation
+        } else {
+          console.log(`⏭️ Could not parse amount/merchant from YES BANK email ${msg.id}`);
         }
       }
 
       // --- For other senders (Amazon, Swiggy, etc.) – create expense directly ---
-      // Extract amount
+      // Extract amount (₹)
       const amountMatch = body.match(/₹\s*([\d,]+(?:\.\d{2})?)/);
       if (!amountMatch) {
         console.log(`⏭️ No amount found in email ${msg.id}`);
@@ -666,8 +664,6 @@ app.post('/api/gmail/sync', authenticateToken, async (req, res) => {
 // ==========================================
 // PENDING IMPORTS ROUTES
 // ==========================================
-
-// Get all pending imports for the user
 app.get('/api/pending', authenticateToken, async (req, res) => {
   try {
     const pending = await prisma.pendingImport.findMany({
@@ -682,7 +678,6 @@ app.get('/api/pending', authenticateToken, async (req, res) => {
   }
 });
 
-// Update a pending import (edit amount, merchant, date, note, category)
 app.put('/api/pending/:id', authenticateToken, async (req, res) => {
   const { amount, merchant, date, note, categoryId } = req.body;
   try {
@@ -704,7 +699,6 @@ app.put('/api/pending/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete (reject) a pending import
 app.delete('/api/pending/:id', authenticateToken, async (req, res) => {
   try {
     await prisma.pendingImport.delete({
@@ -716,7 +710,6 @@ app.delete('/api/pending/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Confirm a pending import → create an expense
 app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
   const { categoryId } = req.body;
   try {
@@ -726,7 +719,6 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
     if (!pending) {
       return res.status(404).json({ error: 'Pending import not found or already processed.' });
     }
-    // Create expense
     const expense = await prisma.expense.create({
       data: {
         amount: pending.amount,
@@ -737,7 +729,6 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
         isRecurring: false,
       },
     });
-    // Update pending status to confirmed
     await prisma.pendingImport.update({
       where: { id: pending.id },
       data: { status: 'confirmed' },
