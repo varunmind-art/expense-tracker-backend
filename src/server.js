@@ -603,7 +603,7 @@ const processGmailReceipts = async (userId) => {
       // --- Filter out non-expense emails (delivery, cashback, refund, etc.) ---
       const subjectLower = subject.toLowerCase();
       const bodyLower = body.toLowerCase();
-      const skipKeywords = ['cashback', 'refund', 'delivery', 'order has been received', 'delivered', 'received'];
+      const skipKeywords = ['cashback', 'refund', 'delivery', 'order has been received', 'delivered', 'received', 'your order is out for delivery'];
       const isSkip = skipKeywords.some(kw => subjectLower.includes(kw) || bodyLower.includes(kw));
       if (isSkip) {
         console.log(`⏭️ Skipping non-expense email: ${subject}`);
