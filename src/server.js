@@ -464,6 +464,16 @@ app.get('/ping', (req, res) => {
 // ==========================================
 // 7. START SERVER
 // ==========================================
+// Manual sync endpoint (to test Gmail import)
+app.post('/api/gmail/sync', authenticateToken, async (req, res) => {
+  try {
+    await processGmailReceipts(req.user.id);
+    res.json({ message: 'Gmail sync completed successfully! Check your expenses.' });
+  } catch (error) {
+    console.error('Manual sync error:', error);
+    res.status(500).json({ error: 'Sync failed. Check logs for details.' });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Email configured for: ${process.env.EMAIL_USER}`);
