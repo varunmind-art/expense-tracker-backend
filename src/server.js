@@ -63,6 +63,20 @@ const seedCategories = async (userId) => {
   await prisma.category.createMany({ data });
 };
 
+// --- HELPER: Get default category for a user (fallback: "Other") ---
+const getUserDefaultCategory = async (userId) => {
+  let category = await prisma.category.findFirst({
+    where: { userId, name: 'Other' },
+  });
+  if (!category) {
+    category = await prisma.category.findFirst({ where: { userId } });
+  }
+  if (!category) {
+    throw new Error('No category found for user.');
+  }
+  return category;
+};
+
 // ==========================================
 // 1. AUTH ROUTES
 // ==========================================
@@ -436,7 +450,7 @@ const parseYesBankEmail = (subject, body) => {
 };
 
 // ==========================================
-// processGmailReceipts – Updated with better Amazon parsing
+// processGmailReceipts – Updated with ICICI support and default category
 // ==========================================
 const processGmailReceipts = async (userId) => {
   console.log(`📧 Processing Gmail receipts for user ${userId}`);
@@ -466,11 +480,11 @@ const processGmailReceipts = async (userId) => {
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-  // Expanded search query – include amazonpay.in
+  // Expanded search query – include icici.bank.in
   const now = new Date();
   const sevenDaysAgo = new Date(now);
   sevenDaysAgo.setDate(now.getDate() - 7);
-  const query = `from:(amazon.in OR amazonpay.in OR swiggy.in OR zomato.com OR uber.com OR flipkart.com OR yesbank.in OR "syes.bank.in" OR "yes.bank.in" OR "yesbank") after:${Math.floor(sevenDaysAgo.getTime() / 1000)}`;
+  const query = `from:(amazon.in OR amazonpay.in OR swiggy.in OR zomato.com OR uber.com OR flipkart.com OR yesbank.in OR "syes.bank.in" OR "yes.bank.in" OR "yesbank" OR icici.bank.in) after:${Math.floor(sevenDaysAgo.getTime() / 1000)}`;
 
   console.log(`🔍 Searching emails with query: "${query}"`);
   
@@ -490,6 +504,16 @@ const processGmailReceipts = async (userId) => {
 
   if (messages.length === 0) {
     console.log('ℹ️ No matching emails found in the last 7 days');
+    return;
+  }
+
+  // Fetch default category once for this user
+  let defaultCategory = null;
+  try {
+    defaultCategory = await getUserDefaultCategory(userId);
+  } catch (error) {
+    console.error('❌ Failed to get default category:', error.message);
+    // If no category, skip creating expenses
     return;
   }
 
@@ -568,7 +592,8 @@ const processGmailReceipts = async (userId) => {
         }
       }
 
-      // --- Amazon / Other merchants: extract amount and merchant ---
+      // --- Amazon / ICICI / other merchants: extract amount and merchant ---
+      let amount = null;
       let amountMatch = body.match(/(?:Rs|₹|INR)\s*([\d,]+(?:\.\d{2})?)/i);
       if (!amountMatch) {
         amountMatch = body.match(/([\d,]+\.\d{2})\s*(?:was paid|paid|spent)/i);
@@ -576,11 +601,14 @@ const processGmailReceipts = async (userId) => {
       if (!amountMatch) {
         amountMatch = subject.match(/(?:Rs|₹|INR)\s*([\d,]+(?:\.\d{2})?)/i);
       }
-      if (!amountMatch) {
+      if (amountMatch) {
+        amount = parseFloat(amountMatch[1].replace(/,/g, ''));
+      }
+
+      if (!amount) {
         console.log(`⏭️ No amount found in email ${msg.id}`);
         continue;
       }
-      const amount = parseFloat(amountMatch[1].replace(/,/g, ''));
       console.log(`💰 Found amount: ₹${amount}`);
 
       // Determine merchant
@@ -590,6 +618,7 @@ const processGmailReceipts = async (userId) => {
       else if (sender.includes('zomato')) merchant = 'Zomato';
       else if (sender.includes('uber')) merchant = 'Uber';
       else if (sender.includes('flipkart')) merchant = 'Flipkart';
+      else if (sender.includes('icici')) merchant = 'ICICI Bank';
 
       // Check for duplicate expense
       const existing = await prisma.expense.findFirst({
@@ -605,7 +634,7 @@ const processGmailReceipts = async (userId) => {
         continue;
       }
 
-      // Create expense
+      // Create expense with default category
       await prisma.expense.create({
         data: {
           amount,
@@ -613,7 +642,7 @@ const processGmailReceipts = async (userId) => {
           note: `Auto-import: ${subject}`,
           isRecurring: false,
           userId,
-          categoryId: null,
+          categoryId: defaultCategory.id, // always use the default category
         },
       });
       importedCount++;
