@@ -11,30 +11,33 @@ datasource db {
 model User {
   id            String    @id @default(cuid())
   email         String    @unique
-  password      String    // Hashed
+  password      String
   name          String?
   createdAt     DateTime  @default(now())
-  gmailRefreshToken String?    // store encrypted refresh token
+  gmailRefreshToken String?   // for Gmail integration
+  
   categories    Category[]
   expenses      Expense[]
   budgets       Budget[]
   recurringRules RecurringRule[]
+  pendingImports PendingImport[]  // ✅ added reverse relation
 }
 
 model Category {
   id            String    @id @default(cuid())
   name          String
-  icon          String?   // Emoji or icon name (e.g., "🍕", "🚗")
-  color         String?   // Hex color code
-  isDefault     Boolean   @default(false) // Pre-seeded categories
+  icon          String?
+  color         String?
+  isDefault     Boolean   @default(false)
   userId        String
   user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   
   expenses      Expense[]
   budgets       Budget[]
   recurringRules RecurringRule[]
+  pendingImports PendingImport[]  // ✅ added reverse relation
 
-  @@unique([userId, name]) // One user can't have duplicate category names
+  @@unique([userId, name])
 }
 
 model Expense {
@@ -42,7 +45,7 @@ model Expense {
   amount        Decimal   @db.Decimal(10, 2)
   date          DateTime  @default(now())
   note          String?
-  receiptUrl    String?   // Cloudinary URL
+  receiptUrl    String?
   isRecurring   Boolean   @default(false)
   userId        String
   user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -63,7 +66,7 @@ model Budget {
   categoryId    String
   category      Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
 
-  @@unique([userId, categoryId, period]) // One budget per category per period
+  @@unique([userId, categoryId, period])
 }
 
 model RecurringRule {
@@ -71,13 +74,29 @@ model RecurringRule {
   description   String
   amount        Decimal   @db.Decimal(10, 2)
   frequency     String    // "DAILY", "WEEKLY", "MONTHLY", "YEARLY"
-  dayOfMonth    Int?      // For MONTHLY (e.g., 1 for 1st of month)
-  dayOfWeek     Int?      // For WEEKLY (0=Sunday, 6=Saturday)
-  nextExecution DateTime  // When to trigger next
+  dayOfMonth    Int?
+  dayOfWeek     Int?
+  nextExecution DateTime
   isActive      Boolean   @default(true)
-  
   userId        String
   user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   categoryId    String
   category      Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+}
+
+model PendingImport {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount      Decimal  @db.Decimal(10,2)
+  date        DateTime
+  merchant    String
+  note        String?
+  categoryId  String?
+  category    Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  source      String   // e.g., "GMAIL_YESBANK"
+  sourceId    String   // email ID or unique transaction ID to prevent duplicates
+  status      String   @default("pending") // pending, confirmed, rejected
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }

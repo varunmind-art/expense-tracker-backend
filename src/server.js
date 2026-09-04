@@ -407,7 +407,30 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // ==========================================
-// processGmailReceipts function (DEFINED FIRST)
+// Helper: Parse YES BANK emails
+// ==========================================
+const parseYesBankEmail = (subject, body) => {
+  const result = { amount: null, merchant: null };
+  // Extract amount – look for ₹ symbol
+  const amountMatch = body.match(/₹\s*([\d,]+(?:\.\d{2})?)/);
+  if (amountMatch) {
+    result.amount = parseFloat(amountMatch[1].replace(/,/g, ''));
+  }
+  // Extract merchant – look for "at" or "at " followed by text
+  const merchantMatch = body.match(/at\s+([A-Za-z0-9\s\.\-]+)/i);
+  if (merchantMatch) {
+    result.merchant = merchantMatch[1].trim();
+  }
+  // If not found in body, try subject
+  if (!result.merchant) {
+    const subjectMatch = subject.match(/at\s+([A-Za-z0-9\s\.\-]+)/i);
+    if (subjectMatch) result.merchant = subjectMatch[1].trim();
+  }
+  return result;
+};
+
+// ==========================================
+// processGmailReceipts – now creates pending imports for YES BANK
 // ==========================================
 const processGmailReceipts = async (userId) => {
   console.log(`📧 Processing Gmail receipts for user ${userId}`);
@@ -437,11 +460,11 @@ const processGmailReceipts = async (userId) => {
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-  // Search for recent emails (last 7 days)
+  // Search for recent emails (last 7 days) – include YES BANK
   const now = new Date();
   const sevenDaysAgo = new Date(now);
   sevenDaysAgo.setDate(now.getDate() - 7);
-  const query = `from:(amazon.in OR swiggy.in OR zomato.com OR uber.com OR flipkart.com) after:${Math.floor(sevenDaysAgo.getTime() / 1000)}`;
+  const query = `from:(amazon.in OR swiggy.in OR zomato.com OR uber.com OR flipkart.com OR yesbank.in) after:${Math.floor(sevenDaysAgo.getTime() / 1000)}`;
 
   console.log(`🔍 Searching emails with query: "${query}"`);
   
@@ -456,7 +479,7 @@ const processGmailReceipts = async (userId) => {
     console.log(`📬 Found ${messages.length} matching emails`);
   } catch (error) {
     console.error('❌ Gmail API list error:', error.message);
-    throw error; // rethrow to be caught by the endpoint
+    throw error;
   }
 
   if (messages.length === 0) {
@@ -480,7 +503,7 @@ const processGmailReceipts = async (userId) => {
       for (const header of headers) {
         if (header.name === 'Subject') subject = header.value;
       }
-      // Get plain text body (simplified – you might need to parse parts)
+      // Get plain text body
       if (payload.parts) {
         for (const part of payload.parts) {
           if (part.mimeType === 'text/plain') {
@@ -492,7 +515,43 @@ const processGmailReceipts = async (userId) => {
         body = Buffer.from(payload.body.data, 'base64').toString('utf8');
       }
 
-      // Extract amount (₹) using regex
+      const sender = headers.find(h => h.name === 'From')?.value || '';
+
+      // --- Check if it's a YES BANK alert ---
+      if (sender.includes('YES BANK') || sender.includes('yesbank')) {
+        const parsed = parseYesBankEmail(subject, body);
+        if (parsed.amount && parsed.merchant) {
+          // Check for duplicate
+          const existing = await prisma.pendingImport.findFirst({
+            where: {
+              userId,
+              sourceId: msg.id,
+              source: 'GMAIL_YESBANK',
+            },
+          });
+          if (existing) {
+            console.log(`⏭️ Duplicate pending import for email ${msg.id}`);
+            continue;
+          }
+          await prisma.pendingImport.create({
+            data: {
+              userId,
+              amount: parsed.amount,
+              date: new Date(parseInt(msgData.data.internalDate)),
+              merchant: parsed.merchant,
+              note: subject,
+              source: 'GMAIL_YESBANK',
+              sourceId: msg.id,
+              status: 'pending',
+            },
+          });
+          console.log(`📥 Added pending import: ₹${parsed.amount} from ${parsed.merchant}`);
+          continue; // skip regular expense creation
+        }
+      }
+
+      // --- For other senders (Amazon, Swiggy, etc.) – create expense directly ---
+      // Extract amount
       const amountMatch = body.match(/₹\s*([\d,]+(?:\.\d{2})?)/);
       if (!amountMatch) {
         console.log(`⏭️ No amount found in email ${msg.id}`);
@@ -501,8 +560,7 @@ const processGmailReceipts = async (userId) => {
       const amount = parseFloat(amountMatch[1].replace(/,/g, ''));
       console.log(`💰 Found amount: ₹${amount}`);
 
-      // Determine merchant (from sender or subject)
-      const sender = headers.find(h => h.name === 'From')?.value || '';
+      // Determine merchant
       let merchant = 'Unknown';
       if (sender.includes('amazon')) merchant = 'Amazon';
       else if (sender.includes('swiggy')) merchant = 'Swiggy';
@@ -510,7 +568,7 @@ const processGmailReceipts = async (userId) => {
       else if (sender.includes('uber')) merchant = 'Uber';
       else if (sender.includes('flipkart')) merchant = 'Flipkart';
 
-      // Check if this expense already exists (prevent duplicates)
+      // Prevent duplicates
       const existing = await prisma.expense.findFirst({
         where: {
           userId,
@@ -532,7 +590,7 @@ const processGmailReceipts = async (userId) => {
           note: `Auto-import: ${subject}`,
           isRecurring: false,
           userId,
-          categoryId: null, // you can set a default category like 'Other'
+          categoryId: null,
         },
       });
       importedCount++;
@@ -545,19 +603,8 @@ const processGmailReceipts = async (userId) => {
 };
 
 // ==========================================
-// Manual sync endpoint (USES THE FUNCTION)
+// Gmail OAuth routes
 // ==========================================
-app.post('/api/gmail/sync', authenticateToken, async (req, res) => {
-  try {
-    await processGmailReceipts(req.user.id);
-    res.json({ message: 'Gmail sync completed successfully! Check your expenses.' });
-  } catch (error) {
-    console.error('Manual sync error:', error);
-    res.status(500).json({ error: 'Sync failed. Check logs for details.' });
-  }
-});
-
-// Initiate Gmail OAuth
 app.get('/api/auth/gmail', authenticateToken, (req, res) => {
   const userId = req.user.id;
   const redirectUri = process.env.GOOGLE_REDIRECT_URI;
@@ -572,7 +619,6 @@ app.get('/api/auth/gmail', authenticateToken, (req, res) => {
   res.json({ authUrl });
 });
 
-// Gmail OAuth callback
 app.get('/api/auth/gmail/callback', async (req, res) => {
   const { code, state } = req.query;
   if (!code || !state) {
@@ -591,7 +637,6 @@ app.get('/api/auth/gmail/callback', async (req, res) => {
   }
 });
 
-// Check Gmail connection status
 app.get('/api/auth/gmail/status', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
@@ -602,6 +647,105 @@ app.get('/api/auth/gmail/status', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Gmail status error:', error);
     res.status(500).json({ error: 'Failed to check Gmail status' });
+  }
+});
+
+// ==========================================
+// Manual sync endpoint
+// ==========================================
+app.post('/api/gmail/sync', authenticateToken, async (req, res) => {
+  try {
+    await processGmailReceipts(req.user.id);
+    res.json({ message: 'Gmail sync completed successfully! Check your expenses.' });
+  } catch (error) {
+    console.error('Manual sync error:', error);
+    res.status(500).json({ error: 'Sync failed. Check logs for details.' });
+  }
+});
+
+// ==========================================
+// PENDING IMPORTS ROUTES
+// ==========================================
+
+// Get all pending imports for the user
+app.get('/api/pending', authenticateToken, async (req, res) => {
+  try {
+    const pending = await prisma.pendingImport.findMany({
+      where: { userId: req.user.id, status: 'pending' },
+      orderBy: { date: 'desc' },
+      include: { category: true },
+    });
+    res.json(pending);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to fetch pending imports.' });
+  }
+});
+
+// Update a pending import (edit amount, merchant, date, note, category)
+app.put('/api/pending/:id', authenticateToken, async (req, res) => {
+  const { amount, merchant, date, note, categoryId } = req.body;
+  try {
+    const pending = await prisma.pendingImport.update({
+      where: { id: req.params.id, userId: req.user.id },
+      data: {
+        amount: parseFloat(amount),
+        merchant,
+        date: new Date(date),
+        note,
+        categoryId: categoryId || null,
+      },
+      include: { category: true },
+    });
+    res.json(pending);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to update pending import.' });
+  }
+});
+
+// Delete (reject) a pending import
+app.delete('/api/pending/:id', authenticateToken, async (req, res) => {
+  try {
+    await prisma.pendingImport.delete({
+      where: { id: req.params.id, userId: req.user.id },
+    });
+    res.json({ message: 'Pending import deleted.' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete pending import.' });
+  }
+});
+
+// Confirm a pending import → create an expense
+app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
+  const { categoryId } = req.body;
+  try {
+    const pending = await prisma.pendingImport.findFirst({
+      where: { id: req.params.id, userId: req.user.id, status: 'pending' },
+    });
+    if (!pending) {
+      return res.status(404).json({ error: 'Pending import not found or already processed.' });
+    }
+    // Create expense
+    const expense = await prisma.expense.create({
+      data: {
+        amount: pending.amount,
+        date: pending.date,
+        note: pending.note || pending.merchant,
+        categoryId: categoryId || pending.categoryId,
+        userId: req.user.id,
+        isRecurring: false,
+      },
+    });
+    // Update pending status to confirmed
+    await prisma.pendingImport.update({
+      where: { id: pending.id },
+      data: { status: 'confirmed' },
+    });
+    res.json({ message: 'Expense created from pending import.', expense });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to confirm pending import.' });
   }
 });
 
