@@ -402,30 +402,41 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // ==========================================
-// Improved YES BANK email parser
+// Improved YES BANK email parser (with fallbacks)
 // ==========================================
 const parseYesBankEmail = (subject, body) => {
   const result = { amount: null, merchant: null };
-  // Extract amount – support "INR" or "₹"
-  const amountMatch = body.match(/(?:INR|₹)\s*([\d,]+(?:\.\d{2})?)/i);
+  // Try to extract amount from body first
+  let amountMatch = body.match(/(?:INR|₹)\s*([\d,]+(?:\.\d{2})?)/i);
+  if (!amountMatch) {
+    // Try without currency symbol – look for a number with two decimals
+    amountMatch = body.match(/([\d,]+\.\d{2})\s*(?:has been spent|spent on)/i);
+  }
+  if (!amountMatch) {
+    // Fallback: search subject for a number
+    amountMatch = subject.match(/(?:INR|₹)?\s*([\d,]+(?:\.\d{2})?)/i);
+  }
   if (amountMatch) {
     result.amount = parseFloat(amountMatch[1].replace(/,/g, ''));
   }
-  // Extract merchant – look for "at " followed by text until " on " or " for " or end of line
-  const merchantMatch = body.match(/at\s+([A-Za-z0-9\s\.\-_]+?)(?:\s+on\s+|\s+for\s+|\s*$)/i);
+  // Merchant: look for "at " followed by text until " on " or " for " or end of line
+  let merchantMatch = body.match(/at\s+([A-Za-z0-9\s\.\-_]+?)(?:\s+on\s+|\s+for\s+|\s*$)/i);
+  if (!merchantMatch) {
+    // Fallback: look for "at " until comma or newline
+    merchantMatch = body.match(/at\s+([^\n,]+)/i);
+  }
+  if (!merchantMatch) {
+    // Try subject
+    merchantMatch = subject.match(/at\s+([A-Za-z0-9\s\.\-_]+)/i);
+  }
   if (merchantMatch) {
     result.merchant = merchantMatch[1].trim();
-  }
-  // If not found, try alternate: after "at " until a comma or newline
-  if (!result.merchant) {
-    const altMatch = body.match(/at\s+([^\n,]+)/i);
-    if (altMatch) result.merchant = altMatch[1].trim();
   }
   return result;
 };
 
 // ==========================================
-// processGmailReceipts – now creates pending imports for YES BANK
+// processGmailReceipts – with debug logging and fallback for YES BANK
 // ==========================================
 const processGmailReceipts = async (userId) => {
   console.log(`📧 Processing Gmail receipts for user ${userId}`);
@@ -498,7 +509,7 @@ const processGmailReceipts = async (userId) => {
       for (const header of headers) {
         if (header.name === 'Subject') subject = header.value;
       }
-      // Get plain text body
+      // Get plain text body – try to find text/plain part
       if (payload.parts) {
         for (const part of payload.parts) {
           if (part.mimeType === 'text/plain') {
@@ -509,11 +520,24 @@ const processGmailReceipts = async (userId) => {
       } else if (payload.body && payload.body.data) {
         body = Buffer.from(payload.body.data, 'base64').toString('utf8');
       }
+      // If body is empty, try to get HTML and strip tags (fallback)
+      if (!body && payload.parts) {
+        for (const part of payload.parts) {
+          if (part.mimeType === 'text/html') {
+            const html = Buffer.from(part.body.data, 'base64').toString('utf8');
+            // Very basic stripping – just to get text
+            body = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+            break;
+          }
+        }
+      }
 
       const sender = headers.find(h => h.name === 'From')?.value || '';
 
       // --- Check if it's a YES BANK alert ---
       if (sender.includes('YES BANK') || sender.includes('yesbank') || sender.includes('syes.bank.in')) {
+        console.log(`📨 YES BANK email: subject="${subject}"`);
+        console.log(`📨 Body snippet: "${body.substring(0, 300)}"`);
         const parsed = parseYesBankEmail(subject, body);
         console.log(`📊 Parsed YES BANK: amount=${parsed.amount}, merchant=${parsed.merchant}`);
         if (parsed.amount && parsed.merchant) {
