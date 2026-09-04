@@ -743,23 +743,48 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
     if (!pending) {
       return res.status(404).json({ error: 'Pending import not found or already processed.' });
     }
+
+    // Determine final categoryId
+    let finalCategoryId = categoryId || pending.categoryId;
+    if (!finalCategoryId) {
+      // Try to find the user's "Other" category
+      const defaultCategory = await prisma.category.findFirst({
+        where: { userId: req.user.id, name: 'Other' },
+      });
+      if (defaultCategory) {
+        finalCategoryId = defaultCategory.id;
+      } else {
+        // Fallback to any category
+        const anyCategory = await prisma.category.findFirst({
+          where: { userId: req.user.id },
+        });
+        if (anyCategory) {
+          finalCategoryId = anyCategory.id;
+        } else {
+          return res.status(400).json({ error: 'No category found. Please create a category first.' });
+        }
+      }
+    }
+
     const expense = await prisma.expense.create({
       data: {
         amount: pending.amount,
         date: pending.date,
         note: pending.note || pending.merchant,
-        categoryId: categoryId || pending.categoryId,
+        categoryId: finalCategoryId,
         userId: req.user.id,
         isRecurring: false,
       },
     });
+
     await prisma.pendingImport.update({
       where: { id: pending.id },
       data: { status: 'confirmed' },
     });
+
     res.json({ message: 'Expense created from pending import.', expense });
   } catch (error) {
-    console.error(error);
+    console.error('Confirm error:', error);
     res.status(500).json({ error: 'Failed to confirm pending import.' });
   }
 });
