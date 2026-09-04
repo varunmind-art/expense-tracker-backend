@@ -7,7 +7,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const cron = require('node-cron');
-const { google } = require('googleapis'); // Added for Gmail
+const { google } = require('googleapis');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -406,17 +406,168 @@ const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_REDIRECT_URI
 );
 
+// ==========================================
+// processGmailReceipts function (DEFINED FIRST)
+// ==========================================
+const processGmailReceipts = async (userId) => {
+  console.log(`📧 Processing Gmail receipts for user ${userId}`);
+  
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    console.log(`❌ User ${userId} not found`);
+    return;
+  }
+  
+  if (!user.gmailRefreshToken) {
+    console.log(`❌ No Gmail refresh token for user ${userId}`);
+    return;
+  }
+
+  console.log('🔑 Refresh token exists, setting credentials...');
+  oauth2Client.setCredentials({ refresh_token: user.gmailRefreshToken });
+  
+  try {
+    console.log('🔄 Refreshing access token...');
+    const { credentials } = await oauth2Client.refreshAccessToken();
+    console.log('✅ Access token refreshed successfully');
+  } catch (error) {
+    console.error('❌ Failed to refresh access token:', error.message);
+    return;
+  }
+
+  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+  // Search for recent emails (last 7 days)
+  const now = new Date();
+  const sevenDaysAgo = new Date(now);
+  sevenDaysAgo.setDate(now.getDate() - 7);
+  const query = `from:(amazon.in OR swiggy.in OR zomato.com OR uber.com OR flipkart.com) after:${Math.floor(sevenDaysAgo.getTime() / 1000)}`;
+
+  console.log(`🔍 Searching emails with query: "${query}"`);
+  
+  let messages = [];
+  try {
+    const res = await gmail.users.messages.list({
+      userId: 'me',
+      q: query,
+      maxResults: 50,
+    });
+    messages = res.data.messages || [];
+    console.log(`📬 Found ${messages.length} matching emails`);
+  } catch (error) {
+    console.error('❌ Gmail API list error:', error.message);
+    throw error; // rethrow to be caught by the endpoint
+  }
+
+  if (messages.length === 0) {
+    console.log('ℹ️ No matching emails found in the last 7 days');
+    return;
+  }
+
+  let importedCount = 0;
+  for (const msg of messages) {
+    try {
+      console.log(`📩 Fetching email ${msg.id}...`);
+      const msgData = await gmail.users.messages.get({
+        userId: 'me',
+        id: msg.id,
+        format: 'full',
+      });
+      const payload = msgData.data.payload;
+      let subject = '';
+      let body = '';
+      const headers = payload.headers;
+      for (const header of headers) {
+        if (header.name === 'Subject') subject = header.value;
+      }
+      // Get plain text body (simplified – you might need to parse parts)
+      if (payload.parts) {
+        for (const part of payload.parts) {
+          if (part.mimeType === 'text/plain') {
+            body = Buffer.from(part.body.data, 'base64').toString('utf8');
+            break;
+          }
+        }
+      } else if (payload.body && payload.body.data) {
+        body = Buffer.from(payload.body.data, 'base64').toString('utf8');
+      }
+
+      // Extract amount (₹) using regex
+      const amountMatch = body.match(/₹\s*([\d,]+(?:\.\d{2})?)/);
+      if (!amountMatch) {
+        console.log(`⏭️ No amount found in email ${msg.id}`);
+        continue;
+      }
+      const amount = parseFloat(amountMatch[1].replace(/,/g, ''));
+      console.log(`💰 Found amount: ₹${amount}`);
+
+      // Determine merchant (from sender or subject)
+      const sender = headers.find(h => h.name === 'From')?.value || '';
+      let merchant = 'Unknown';
+      if (sender.includes('amazon')) merchant = 'Amazon';
+      else if (sender.includes('swiggy')) merchant = 'Swiggy';
+      else if (sender.includes('zomato')) merchant = 'Zomato';
+      else if (sender.includes('uber')) merchant = 'Uber';
+      else if (sender.includes('flipkart')) merchant = 'Flipkart';
+
+      // Check if this expense already exists (prevent duplicates)
+      const existing = await prisma.expense.findFirst({
+        where: {
+          userId,
+          amount,
+          note: { contains: subject },
+          date: { gte: sevenDaysAgo },
+        },
+      });
+      if (existing) {
+        console.log(`⏭️ Duplicate expense found for email ${msg.id}, skipping.`);
+        continue;
+      }
+
+      // Create expense
+      await prisma.expense.create({
+        data: {
+          amount,
+          date: new Date(parseInt(msgData.data.internalDate)),
+          note: `Auto-import: ${subject}`,
+          isRecurring: false,
+          userId,
+          categoryId: null, // you can set a default category like 'Other'
+        },
+      });
+      importedCount++;
+      console.log(`✅ Auto-imported expense for user ${userId}: ₹${amount} from ${merchant}`);
+    } catch (error) {
+      console.error(`❌ Error processing email ${msg.id}:`, error.message);
+    }
+  }
+  console.log(`📊 Imported ${importedCount} new expenses.`);
+};
+
+// ==========================================
+// Manual sync endpoint (USES THE FUNCTION)
+// ==========================================
+app.post('/api/gmail/sync', authenticateToken, async (req, res) => {
+  try {
+    await processGmailReceipts(req.user.id);
+    res.json({ message: 'Gmail sync completed successfully! Check your expenses.' });
+  } catch (error) {
+    console.error('Manual sync error:', error);
+    res.status(500).json({ error: 'Sync failed. Check logs for details.' });
+  }
+});
+
 // Initiate Gmail OAuth
 app.get('/api/auth/gmail', authenticateToken, (req, res) => {
   const userId = req.user.id;
   const redirectUri = process.env.GOOGLE_REDIRECT_URI;
-  console.log('🔍 GOOGLE_REDIRECT_URI:', redirectUri); // Add this log
+  console.log('🔍 GOOGLE_REDIRECT_URI:', redirectUri);
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: ['https://www.googleapis.com/auth/gmail.readonly'],
     prompt: 'consent',
     state: userId,
-    redirect_uri: redirectUri, // Explicitly pass it
+    redirect_uri: redirectUri,
   });
   res.json({ authUrl });
 });
@@ -440,7 +591,7 @@ app.get('/api/auth/gmail/callback', async (req, res) => {
   }
 });
 
-// Check Gmail connection status (NEW)
+// Check Gmail connection status
 app.get('/api/auth/gmail/status', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
@@ -455,25 +606,15 @@ app.get('/api/auth/gmail/status', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 6. KEEP-ALIVE PING ENDPOINT
+// 7. KEEP-ALIVE PING ENDPOINT
 // ==========================================
 app.get('/ping', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 // ==========================================
-// 7. START SERVER
+// 8. START SERVER
 // ==========================================
-// Manual sync endpoint (to test Gmail import)
-app.post('/api/gmail/sync', authenticateToken, async (req, res) => {
-  try {
-    await processGmailReceipts(req.user.id);
-    res.json({ message: 'Gmail sync completed successfully! Check your expenses.' });
-  } catch (error) {
-    console.error('Manual sync error:', error);
-    res.status(500).json({ error: 'Sync failed. Check logs for details.' });
-  }
-});
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Email configured for: ${process.env.EMAIL_USER}`);
