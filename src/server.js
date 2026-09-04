@@ -420,27 +420,21 @@ const oauth2Client = new google.auth.OAuth2(
 // ==========================================
 const parseYesBankEmail = (subject, body) => {
   const result = { amount: null, merchant: null };
-  // Try to extract amount from body first
   let amountMatch = body.match(/(?:INR|₹)\s*([\d,]+(?:\.\d{2})?)/i);
   if (!amountMatch) {
-    // Try without currency symbol – look for a number with two decimals
     amountMatch = body.match(/([\d,]+\.\d{2})\s*(?:has been spent|spent on)/i);
   }
   if (!amountMatch) {
-    // Fallback: search subject for a number
     amountMatch = subject.match(/(?:INR|₹)?\s*([\d,]+(?:\.\d{2})?)/i);
   }
   if (amountMatch) {
     result.amount = parseFloat(amountMatch[1].replace(/,/g, ''));
   }
-  // Merchant: look for "at " followed by text until " on " or " for " or end of line
   let merchantMatch = body.match(/at\s+([A-Za-z0-9\s\.\-_]+?)(?:\s+on\s+|\s+for\s+|\s*$)/i);
   if (!merchantMatch) {
-    // Fallback: look for "at " until comma or newline
     merchantMatch = body.match(/at\s+([^\n,]+)/i);
   }
   if (!merchantMatch) {
-    // Try subject
     merchantMatch = subject.match(/at\s+([A-Za-z0-9\s\.\-_]+)/i);
   }
   if (merchantMatch) {
@@ -450,7 +444,7 @@ const parseYesBankEmail = (subject, body) => {
 };
 
 // ==========================================
-// processGmailReceipts – Updated with ICICI support and default category
+// processGmailReceipts – with filter to skip non-expense emails
 // ==========================================
 const processGmailReceipts = async (userId) => {
   console.log(`📧 Processing Gmail receipts for user ${userId}`);
@@ -480,7 +474,6 @@ const processGmailReceipts = async (userId) => {
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-  // Expanded search query – include icici.bank.in
   const now = new Date();
   const sevenDaysAgo = new Date(now);
   sevenDaysAgo.setDate(now.getDate() - 7);
@@ -507,13 +500,11 @@ const processGmailReceipts = async (userId) => {
     return;
   }
 
-  // Fetch default category once for this user
   let defaultCategory = null;
   try {
     defaultCategory = await getUserDefaultCategory(userId);
   } catch (error) {
     console.error('❌ Failed to get default category:', error.message);
-    // If no category, skip creating expenses
     return;
   }
 
@@ -534,7 +525,6 @@ const processGmailReceipts = async (userId) => {
         if (header.name === 'Subject') subject = header.value;
       }
       
-      // Improved body extraction
       if (payload.parts) {
         for (const part of payload.parts) {
           if (part.mimeType === 'text/plain') {
@@ -545,7 +535,6 @@ const processGmailReceipts = async (userId) => {
       } else if (payload.body && payload.body.data) {
         body = Buffer.from(payload.body.data, 'base64').toString('utf8');
       }
-      // Fallback: strip HTML if plain text not found
       if (!body && payload.parts) {
         for (const part of payload.parts) {
           if (part.mimeType === 'text/html') {
@@ -558,7 +547,7 @@ const processGmailReceipts = async (userId) => {
 
       const sender = headers.find(h => h.name === 'From')?.value || '';
 
-      // --- Check if it's a YES BANK alert ---
+      // --- YES BANK (pending) ---
       if (sender.includes('YES BANK') || sender.includes('yesbank') || sender.includes('syes.bank.in')) {
         console.log(`📨 YES BANK email: subject="${subject}"`);
         console.log(`📨 Body snippet: "${body.substring(0, 300)}"`);
@@ -592,7 +581,7 @@ const processGmailReceipts = async (userId) => {
         }
       }
 
-      // --- Amazon / ICICI / other merchants: extract amount and merchant ---
+      // --- Amazon / ICICI / other merchants ---
       let amount = null;
       let amountMatch = body.match(/(?:Rs|₹|INR)\s*([\d,]+(?:\.\d{2})?)/i);
       if (!amountMatch) {
@@ -611,6 +600,16 @@ const processGmailReceipts = async (userId) => {
       }
       console.log(`💰 Found amount: ₹${amount}`);
 
+      // --- Filter out non-expense emails (delivery, cashback, refund, etc.) ---
+      const subjectLower = subject.toLowerCase();
+      const bodyLower = body.toLowerCase();
+      const skipKeywords = ['cashback', 'refund', 'delivery', 'order has been received', 'delivered', 'received'];
+      const isSkip = skipKeywords.some(kw => subjectLower.includes(kw) || bodyLower.includes(kw));
+      if (isSkip) {
+        console.log(`⏭️ Skipping non-expense email: ${subject}`);
+        continue;
+      }
+
       // Determine merchant
       let merchant = 'Unknown';
       if (sender.includes('amazon') || sender.includes('amazonpay')) merchant = 'Amazon';
@@ -620,7 +619,7 @@ const processGmailReceipts = async (userId) => {
       else if (sender.includes('flipkart')) merchant = 'Flipkart';
       else if (sender.includes('icici')) merchant = 'ICICI Bank';
 
-      // Check for duplicate expense
+      // Prevent duplicates
       const existing = await prisma.expense.findFirst({
         where: {
           userId,
@@ -642,7 +641,7 @@ const processGmailReceipts = async (userId) => {
           note: `Auto-import: ${subject}`,
           isRecurring: false,
           userId,
-          categoryId: defaultCategory.id, // always use the default category
+          categoryId: defaultCategory.id,
         },
       });
       importedCount++;
