@@ -17,10 +17,13 @@ const PORT = process.env.PORT || 5001;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// --- Email Transporter ---
+// --- Email Transporter (Gmail SMTP) ---
 const transporter = nodemailer.createTransport({
   service: 'gmail',
-  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_APP_PASSWORD },
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_APP_PASSWORD,
+  },
 });
 
 // --- JWT Auth Middleware ---
@@ -36,32 +39,42 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// --- Default Categories ---
+// --- Default Categories (with type) ---
 const DEFAULT_CATEGORIES = [
-  { name: 'Food & Dining', icon: '🍔', color: '#FF6B6B' },
-  { name: 'Transport', icon: '🚗', color: '#4ECDC4' },
-  { name: 'Shopping', icon: '🛍️', color: '#45B7D1' },
-  { name: 'Bills & Utilities', icon: '📄', color: '#96CEB4' },
-  { name: 'Entertainment', icon: '🎬', color: '#FFEEAD' },
-  { name: 'Healthcare', icon: '🏥', color: '#D4A5A5' },
-  { name: 'Education', icon: '📚', color: '#9B59B6' },
-  { name: 'Rent', icon: '🏠', color: '#E67E22' },
-  { name: 'Salary', icon: '💰', color: '#2ECC71' },
-  { name: 'Other', icon: '📌', color: '#95A5A6' },
-  // ⭐ NEW – savings-friendly categories
-  { name: 'Mutual Funds', icon: '📈', color: '#2ECC71' },
-  { name: 'Emergency Fund', icon: '🛟', color: '#E74C3C' },
-  { name: 'Stocks', icon: '📊', color: '#3498DB' },
+  { name: 'Food & Dining',      icon: '🍔', color: '#FF6B6B', type: 'EXPENSE' },
+  { name: 'Transport',           icon: '🚗', color: '#4ECDC4', type: 'EXPENSE' },
+  { name: 'Shopping',            icon: '🛍️', color: '#45B7D1', type: 'EXPENSE' },
+  { name: 'Bills & Utilities',   icon: '📄', color: '#96CEB4', type: 'EXPENSE' },
+  { name: 'Entertainment',       icon: '🎬', color: '#FFEEAD', type: 'EXPENSE' },
+  { name: 'Healthcare',          icon: '🏥', color: '#D4A5A5', type: 'EXPENSE' },
+  { name: 'Education',           icon: '📚', color: '#9B59B6', type: 'EXPENSE' },
+  { name: 'Rent',                icon: '🏠', color: '#E67E22', type: 'EXPENSE' },
+  { name: 'Salary',              icon: '💰', color: '#2ECC71', type: 'EXPENSE' },
+  { name: 'Other',               icon: '📌', color: '#95A5A6', type: 'EXPENSE' },
+  // ⭐ Savings categories
+  { name: 'Mutual Funds',        icon: '📈', color: '#2ECC71', type: 'SAVINGS' },
+  { name: 'Emergency Fund',      icon: '🛟', color: '#E74C3C', type: 'SAVINGS' },
+  { name: 'Stocks',              icon: '📊', color: '#3498DB', type: 'SAVINGS' },
 ];
 
+// --- HELPER: Seed Categories for a new user ---
 const seedCategories = async (userId) => {
-  const data = DEFAULT_CATEGORIES.map((cat) => ({ ...cat, isDefault: true, userId }));
+  const data = DEFAULT_CATEGORIES.map((cat) => ({
+    ...cat,
+    isDefault: true,
+    userId,
+  }));
   await prisma.category.createMany({ data });
 };
 
+// --- HELPER: Get default category for a user (fallback: "Other") ---
 const getUserDefaultCategory = async (userId) => {
-  let category = await prisma.category.findFirst({ where: { userId, name: 'Other' } });
-  if (!category) category = await prisma.category.findFirst({ where: { userId } });
+  let category = await prisma.category.findFirst({
+    where: { userId, name: 'Other' },
+  });
+  if (!category) {
+    category = await prisma.category.findFirst({ where: { userId } });
+  }
   if (!category) throw new Error('No category found for user.');
   return category;
 };
@@ -78,7 +91,9 @@ app.post('/api/auth/register', async (req, res) => {
     if (existing) return res.status(409).json({ error: 'Email already registered.' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const user = await prisma.user.create({ data: { email, password: hashedPassword, name } });
+    const user = await prisma.user.create({
+      data: { email, password: hashedPassword, name },
+    });
 
     await seedCategories(user.id);
 
@@ -137,7 +152,10 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const { token, newPassword } = req.body;
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const hashed = await bcrypt.hash(newPassword, 10);
-    await prisma.user.update({ where: { id: decoded.id }, data: { password: hashed } });
+    await prisma.user.update({
+      where: { id: decoded.id },
+      data: { password: hashed },
+    });
     res.json({ message: 'Password updated successfully.' });
   } catch (error) {
     res.status(400).json({ error: 'Invalid or expired token.' });
@@ -145,7 +163,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // ==========================================
-// 2. EXPENSE ROUTES (updated to support type)
+// 2. EXPENSE ROUTES (Protected)
 // ==========================================
 app.get('/api/expenses', authenticateToken, async (req, res) => {
   try {
@@ -155,7 +173,7 @@ app.get('/api/expenses', authenticateToken, async (req, res) => {
     if (startDate) where.date = { ...where.date, gte: new Date(startDate) };
     if (endDate) where.date = { ...where.date, lte: new Date(endDate) };
     if (categoryId) where.categoryId = categoryId;
-    if (type) where.type = type; // ⭐ NEW
+    if (type) where.type = type;
     if (search) {
       where.OR = [
         { note: { contains: search, mode: 'insensitive' } },
@@ -164,7 +182,9 @@ app.get('/api/expenses', authenticateToken, async (req, res) => {
     }
 
     const expenses = await prisma.expense.findMany({
-      where, include: { category: true }, orderBy: { date: 'desc' },
+      where,
+      include: { category: true },
+      orderBy: { date: 'desc' },
     });
     res.json(expenses);
   } catch (error) {
@@ -182,7 +202,7 @@ app.post('/api/expenses', authenticateToken, async (req, res) => {
         note,
         receiptUrl,
         isRecurring: isRecurring || false,
-        type: type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE', // ⭐ NEW
+        type: type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE',
         userId: req.user.id,
         categoryId,
       },
@@ -206,7 +226,7 @@ app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
         note,
         categoryId,
         receiptUrl,
-        ...(type && { type }), // ⭐ NEW
+        ...(type && { type }),
       },
       include: { category: true },
     });
@@ -218,14 +238,16 @@ app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
 
 app.delete('/api/expenses/:id', authenticateToken, async (req, res) => {
   try {
-    await prisma.expense.delete({ where: { id: req.params.id, userId: req.user.id } });
+    await prisma.expense.delete({
+      where: { id: req.params.id, userId: req.user.id },
+    });
     res.json({ message: 'Expense deleted.' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete expense.' });
   }
 });
 
-// Export CSV (now includes type)
+// Export CSV
 app.get('/api/export/csv', authenticateToken, async (req, res) => {
   try {
     const expenses = await prisma.expense.findMany({
@@ -248,7 +270,7 @@ app.get('/api/export/csv', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 3. INCOME ROUTES ⭐ NEW
+// 3. INCOME ROUTES
 // ==========================================
 app.get('/api/incomes', authenticateToken, async (req, res) => {
   try {
@@ -303,7 +325,7 @@ app.delete('/api/incomes/:id', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 4. DASHBOARD SUMMARY ⭐ NEW
+// 4. DASHBOARD SUMMARY
 // ==========================================
 app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
   try {
@@ -338,14 +360,12 @@ app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
     const unspent = totalIncome - spent - saved;
     const savingsRate = totalIncome > 0 ? (saved / totalIncome) * 100 : 0;
 
-    // Savings breakdown by category
     const breakdown = {};
     savingsRows.forEach((r) => {
       const name = r.category?.name || 'Uncategorized';
       breakdown[name] = (breakdown[name] || 0) + parseFloat(r.amount || 0);
     });
 
-    // Expenses breakdown by category (useful too)
     const expenseBreakdown = {};
     expenseRows.forEach((r) => {
       const name = r.category?.name || 'Uncategorized';
@@ -378,7 +398,10 @@ app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
 // ==========================================
 app.get('/api/categories', authenticateToken, async (req, res) => {
   try {
-    const categories = await prisma.category.findMany({ where: { userId: req.user.id }, orderBy: { name: 'asc' } });
+    const categories = await prisma.category.findMany({
+      where: { userId: req.user.id },
+      orderBy: { name: 'asc' },
+    });
     res.json(categories);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch categories.' });
@@ -387,9 +410,16 @@ app.get('/api/categories', authenticateToken, async (req, res) => {
 
 app.post('/api/categories', authenticateToken, async (req, res) => {
   try {
-    const { name, icon, color } = req.body;
+    const { name, icon, color, type } = req.body;
     const category = await prisma.category.create({
-      data: { name, icon, color, userId: req.user.id, isDefault: false },
+      data: {
+        name,
+        icon,
+        color,
+        type: type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE',
+        userId: req.user.id,
+        isDefault: false,
+      },
     });
     res.status(201).json(category);
   } catch (error) {
@@ -400,22 +430,30 @@ app.post('/api/categories', authenticateToken, async (req, res) => {
 
 app.put('/api/categories/:id', authenticateToken, async (req, res) => {
   try {
-    const { name, icon, color } = req.body;
+    const { name, icon, color, type } = req.body;
     if (!name || !name.trim()) return res.status(400).json({ error: 'Category name is required.' });
     const category = await prisma.category.update({
       where: { id: req.params.id, userId: req.user.id },
-      data: { name: name.trim(), icon, color },
+      data: {
+        name: name.trim(),
+        icon,
+        color,
+        ...(type && { type: type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE' }),
+      },
     });
     res.json(category);
   } catch (error) {
     if (error.code === 'P2002') return res.status(409).json({ error: 'A category with this name already exists.' });
+    console.error('Update category error:', error);
     res.status(500).json({ error: 'Failed to update category.' });
   }
 });
 
 app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
   try {
-    await prisma.category.delete({ where: { id: req.params.id, userId: req.user.id, isDefault: false } });
+    await prisma.category.delete({
+      where: { id: req.params.id, userId: req.user.id, isDefault: false },
+    });
     res.json({ message: 'Category deleted.' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete category.' });
@@ -427,7 +465,10 @@ app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
 // ==========================================
 app.get('/api/budgets', authenticateToken, async (req, res) => {
   try {
-    const budgets = await prisma.budget.findMany({ where: { userId: req.user.id }, include: { category: true } });
+    const budgets = await prisma.budget.findMany({
+      where: { userId: req.user.id },
+      include: { category: true },
+    });
     res.json(budgets);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch budgets.' });
@@ -456,7 +497,9 @@ app.post('/api/budgets', authenticateToken, async (req, res) => {
 
 app.delete('/api/budgets/:id', authenticateToken, async (req, res) => {
   try {
-    await prisma.budget.delete({ where: { id: req.params.id, userId: req.user.id } });
+    await prisma.budget.delete({
+      where: { id: req.params.id, userId: req.user.id },
+    });
     res.json({ message: 'Budget deleted.' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete budget.' });
@@ -498,9 +541,15 @@ const processRecurringExpenses = async () => {
           nextExec.setDate(rule.dayOfMonth);
           if (nextExec.getDate() !== rule.dayOfMonth) nextExec.setDate(0);
         }
-      } else if (rule.frequency === 'YEARLY') nextExec.setFullYear(today.getFullYear() + 1);
+      } else if (rule.frequency === 'YEARLY') {
+        nextExec.setFullYear(today.getFullYear() + 1);
+      }
 
-      await prisma.recurringRule.update({ where: { id: rule.id }, data: { nextExecution: nextExec } });
+      await prisma.recurringRule.update({
+        where: { id: rule.id },
+        data: { nextExecution: nextExec },
+      });
+
       console.log(`✅ Auto-created expense for "${rule.description}"`);
     } catch (error) {
       console.error(`❌ Failed to process recurring rule ${rule.id}:`, error);
@@ -512,7 +561,7 @@ cron.schedule('30 18 * * *', processRecurringExpenses);
 setTimeout(processRecurringExpenses, 10000);
 
 // ==========================================
-// 8. GMAIL INTEGRATION (unchanged)
+// 8. GMAIL INTEGRATION
 // ==========================================
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -584,7 +633,10 @@ const processGmailReceipts = async (userId) => {
 
       if (payload.parts) {
         for (const part of payload.parts) {
-          if (part.mimeType === 'text/plain') { body = Buffer.from(part.body.data, 'base64').toString('utf8'); break; }
+          if (part.mimeType === 'text/plain') {
+            body = Buffer.from(part.body.data, 'base64').toString('utf8');
+            break;
+          }
         }
       } else if (payload.body && payload.body.data) {
         body = Buffer.from(payload.body.data, 'base64').toString('utf8');
@@ -603,7 +655,9 @@ const processGmailReceipts = async (userId) => {
       if (sender.includes('YES BANK') || sender.includes('yesbank') || sender.includes('syes.bank.in')) {
         const parsed = parseYesBankEmail(subject, body);
         if (parsed.amount && parsed.merchant) {
-          const existing = await prisma.pendingImport.findFirst({ where: { userId, sourceId: msg.id, source: 'GMAIL_YESBANK' } });
+          const existing = await prisma.pendingImport.findFirst({
+            where: { userId, sourceId: msg.id, source: 'GMAIL_YESBANK' },
+          });
           if (!existing) {
             await prisma.pendingImport.create({
               data: {
@@ -678,7 +732,10 @@ app.get('/api/auth/gmail/callback', async (req, res) => {
   if (!code || !state) return res.status(400).send('Missing code or user ID');
   try {
     const { tokens } = await oauth2Client.getToken(code);
-    await prisma.user.update({ where: { id: state }, data: { gmailRefreshToken: tokens.refresh_token } });
+    await prisma.user.update({
+      where: { id: state },
+      data: { gmailRefreshToken: tokens.refresh_token },
+    });
     res.send('Gmail connected successfully! You can close this tab.');
   } catch (error) {
     console.error('Gmail OAuth error:', error);
@@ -688,7 +745,10 @@ app.get('/api/auth/gmail/callback', async (req, res) => {
 
 app.get('/api/auth/gmail/status', authenticateToken, async (req, res) => {
   try {
-    const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { gmailRefreshToken: true } });
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { gmailRefreshToken: true },
+    });
     res.json({ connected: !!user?.gmailRefreshToken });
   } catch (error) {
     res.status(500).json({ error: 'Failed to check Gmail status' });
@@ -726,7 +786,13 @@ app.put('/api/pending/:id', authenticateToken, async (req, res) => {
   try {
     const pending = await prisma.pendingImport.update({
       where: { id: req.params.id, userId: req.user.id },
-      data: { amount: parseFloat(amount), merchant, date: new Date(date), note, categoryId: categoryId || null },
+      data: {
+        amount: parseFloat(amount),
+        merchant,
+        date: new Date(date),
+        note,
+        categoryId: categoryId || null,
+      },
       include: { category: true },
     });
     res.json(pending);
@@ -737,7 +803,9 @@ app.put('/api/pending/:id', authenticateToken, async (req, res) => {
 
 app.delete('/api/pending/:id', authenticateToken, async (req, res) => {
   try {
-    await prisma.pendingImport.delete({ where: { id: req.params.id, userId: req.user.id } });
+    await prisma.pendingImport.delete({
+      where: { id: req.params.id, userId: req.user.id },
+    });
     res.json({ message: 'Pending import deleted.' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete pending import.' });
@@ -770,7 +838,10 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
       },
     });
 
-    await prisma.pendingImport.update({ where: { id: pending.id }, data: { status: 'confirmed' } });
+    await prisma.pendingImport.update({
+      where: { id: pending.id },
+      data: { status: 'confirmed' },
+    });
     res.json({ message: 'Expense created from pending import.', expense });
   } catch (error) {
     console.error('Confirm error:', error);
@@ -779,9 +850,11 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 10. KEEP-ALIVE
+// 10. KEEP-ALIVE PING
 // ==========================================
-app.get('/ping', (req, res) => res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() }));
+app.get('/ping', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
 // ==========================================
 // 11. START SERVER
