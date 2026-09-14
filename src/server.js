@@ -428,6 +428,48 @@ app.post('/api/categories', authenticateToken, async (req, res) => {
   }
 });
 
+// ⭐ One-time seed of savings categories for existing users
+app.post('/api/seed-savings-categories', authenticateToken, async (req, res) => {
+  try {
+    const savingsDefaults = [
+      { name: 'Mutual Funds',   icon: '📈', color: '#2ECC71', type: 'SAVINGS' },
+      { name: 'Emergency Fund', icon: '🛟', color: '#E74C3C', type: 'SAVINGS' },
+      { name: 'Stocks',         icon: '📊', color: '#3498DB', type: 'SAVINGS' },
+    ];
+
+    const created = [];
+    const skipped = [];
+
+    for (const cat of savingsDefaults) {
+      const existing = await prisma.category.findFirst({
+        where: { userId: req.user.id, name: cat.name },
+      });
+      if (existing) {
+        // If it already exists but is EXPENSE, upgrade it to SAVINGS
+        if (existing.type !== 'SAVINGS') {
+          await prisma.category.update({
+            where: { id: existing.id },
+            data: { type: 'SAVINGS' },
+          });
+          skipped.push(`${cat.name} (upgraded to SAVINGS)`);
+        } else {
+          skipped.push(`${cat.name} (already exists)`);
+        }
+        continue;
+      }
+      const c = await prisma.category.create({
+        data: { ...cat, userId: req.user.id, isDefault: true },
+      });
+      created.push(c.name);
+    }
+
+    res.json({ message: 'Seed complete', created, skipped });
+  } catch (error) {
+    console.error('Seed error:', error);
+    res.status(500).json({ error: 'Failed to seed savings categories.' });
+  }
+});
+
 app.put('/api/categories/:id', authenticateToken, async (req, res) => {
   try {
     const { name, icon, color, type } = req.body;
