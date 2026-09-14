@@ -286,6 +286,27 @@ app.post('/api/categories', authenticateToken, async (req, res) => {
   }
 });
 
+// Update category (name, icon, color)
+app.put('/api/categories/:id', authenticateToken, async (req, res) => {
+  try {
+    const { name, icon, color } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'Category name is required.' });
+    }
+    const category = await prisma.category.update({
+      where: { id: req.params.id, userId: req.user.id },
+      data: { name: name.trim(), icon, color },
+    });
+    res.json(category);
+  } catch (error) {
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'A category with this name already exists.' });
+    }
+    console.error('Update category error:', error);
+    res.status(500).json({ error: 'Failed to update category.' });
+  }
+});
+
 app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
   try {
     await prisma.category.delete({
