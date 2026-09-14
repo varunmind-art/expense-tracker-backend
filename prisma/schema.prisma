@@ -9,18 +9,19 @@ datasource db {
 }
 
 model User {
-  id            String    @id @default(cuid())
-  email         String    @unique
-  password      String
-  name          String?
-  createdAt     DateTime  @default(now())
-  gmailRefreshToken String?   // for Gmail integration
-  
-  categories    Category[]
-  expenses      Expense[]
-  budgets       Budget[]
+  id                String    @id @default(cuid())
+  email             String    @unique
+  password          String
+  name              String?
+  createdAt         DateTime  @default(now())
+  gmailRefreshToken String?
+
+  categories     Category[]
+  expenses       Expense[]
+  budgets        Budget[]
   recurringRules RecurringRule[]
-  pendingImports PendingImport[]  // ✅ added reverse relation
+  pendingImports PendingImport[]
+  incomes        Income[]
 }
 
 model Category {
@@ -31,72 +32,85 @@ model Category {
   isDefault     Boolean   @default(false)
   userId        String
   user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
-  expenses      Expense[]
-  budgets       Budget[]
+
+  expenses       Expense[]
+  budgets        Budget[]
   recurringRules RecurringRule[]
-  pendingImports PendingImport[]  // ✅ added reverse relation
+  pendingImports PendingImport[]
 
   @@unique([userId, name])
 }
 
 model Expense {
-  id            String    @id @default(cuid())
-  amount        Decimal   @db.Decimal(10, 2)
-  date          DateTime  @default(now())
-  note          String?
-  receiptUrl    String?
-  isRecurring   Boolean   @default(false)
-  userId        String
-  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  categoryId    String
-  category      Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
-  
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id          String   @id @default(cuid())
+  amount      Decimal  @db.Decimal(10, 2)
+  date        DateTime @default(now())
+  note        String?
+  receiptUrl  String?
+  isRecurring Boolean  @default(false)
+  type        String   @default("EXPENSE") // EXPENSE | SAVINGS
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categoryId  String
+  category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model Budget {
-  id            String    @id @default(cuid())
-  amount        Decimal   @db.Decimal(10, 2)
-  period        String    // "MONTHLY" or "WEEKLY"
-  startDate     DateTime  @default(now())
-  userId        String
-  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  categoryId    String
-  category      Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  id         String   @id @default(cuid())
+  amount     Decimal  @db.Decimal(10, 2)
+  period     String
+  startDate  DateTime @default(now())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
 
   @@unique([userId, categoryId, period])
 }
 
 model RecurringRule {
-  id            String    @id @default(cuid())
+  id            String   @id @default(cuid())
   description   String
-  amount        Decimal   @db.Decimal(10, 2)
-  frequency     String    // "DAILY", "WEEKLY", "MONTHLY", "YEARLY"
+  amount        Decimal  @db.Decimal(10, 2)
+  frequency     String
   dayOfMonth    Int?
   dayOfWeek     Int?
   nextExecution DateTime
-  isActive      Boolean   @default(true)
+  isActive      Boolean  @default(true)
   userId        String
-  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   categoryId    String
-  category      Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  category      Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
 }
 
 model PendingImport {
-  id          String   @id @default(cuid())
-  userId      String
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  amount      Decimal  @db.Decimal(10,2)
-  date        DateTime
-  merchant    String
-  note        String?
-  categoryId  String?
-  category    Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
-  source      String   // e.g., "GMAIL_YESBANK"
-  sourceId    String   // email ID or unique transaction ID to prevent duplicates
-  status      String   @default("pending") // pending, confirmed, rejected
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount     Decimal   @db.Decimal(10, 2)
+  date       DateTime
+  merchant   String
+  note       String?
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  source     String
+  sourceId   String
+  status     String    @default("pending")
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+}
+
+model Income {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  source    String   @default("SALARY") // SALARY | FREELANCE | DIVIDEND | RENT | OTHER
+  amount    Decimal  @db.Decimal(10, 2)
+  date      DateTime @default(now())
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
