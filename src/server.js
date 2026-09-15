@@ -537,6 +537,39 @@ app.post('/api/budgets', authenticateToken, async (req, res) => {
   }
 });
 
+// Update an existing budget
+app.put('/api/budgets/:id', authenticateToken, async (req, res) => {
+  try {
+    const { amount, period, categoryId, startDate } = req.body;
+
+    // Make sure the budget belongs to this user
+    const existing = await prisma.budget.findFirst({
+      where: { id: req.params.id, userId: req.user.id },
+    });
+    if (!existing) {
+      return res.status(404).json({ error: 'Budget not found.' });
+    }
+
+    const updated = await prisma.budget.update({
+      where: { id: req.params.id },
+      data: {
+        amount: parseFloat(amount),
+        ...(period && { period }),
+        ...(categoryId && { categoryId }),
+        ...(startDate && { startDate: new Date(startDate) }),
+      },
+      include: { category: true },
+    });
+    res.json(updated);
+  } catch (error) {
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'A budget for this category and period already exists.' });
+    }
+    console.error('Update budget error:', error);
+    res.status(500).json({ error: 'Failed to update budget.' });
+  }
+});
+
 app.delete('/api/budgets/:id', authenticateToken, async (req, res) => {
   try {
     await prisma.budget.delete({
