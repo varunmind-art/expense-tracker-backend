@@ -67,9 +67,8 @@ const computeNextExecution = (frequency, dayOfMonth, dayOfWeek) => {
   const now = new Date();
   now.setHours(0, 0, 0, 0);
   const next = new Date(now);
-  if (frequency === 'DAILY') {
-    next.setDate(now.getDate() + 1);
-  } else if (frequency === 'WEEKLY') {
+  if (frequency === 'DAILY') next.setDate(now.getDate() + 1);
+  else if (frequency === 'WEEKLY') {
     const target = dayOfWeek !== null && dayOfWeek !== undefined ? parseInt(dayOfWeek) : now.getDay();
     const diff = (target - now.getDay() + 7) % 7;
     next.setDate(now.getDate() + (diff === 0 ? 7 : diff));
@@ -78,38 +77,34 @@ const computeNextExecution = (frequency, dayOfMonth, dayOfWeek) => {
     next.setMonth(now.getMonth() + 1);
     next.setDate(targetDate);
     if (next.getDate() !== targetDate) next.setDate(0);
-  } else if (frequency === 'YEARLY') {
-    next.setFullYear(now.getFullYear() + 1);
-  }
+  } else if (frequency === 'YEARLY') next.setFullYear(now.getFullYear() + 1);
   return next;
 };
 
-// ⭐ NEW: Normalise merchant string
 const normaliseMerchant = (m) => {
   if (m === null || m === undefined) return null;
   const trimmed = String(m).trim();
   if (!trimmed) return null;
-  // Cap length to prevent abuse
   return trimmed.slice(0, 100);
 };
-// ⭐ Auto-register merchant into the managed list (idempotent)
+
+// ⭐ Auto-register merchant into the managed list
 const upsertManagedMerchant = async (userId, merchantName) => {
   const name = normaliseMerchant(merchantName);
   if (!name) return;
   try {
     await prisma.merchant.upsert({
       where: { userId_name: { userId, name } },
-      update: {}, // no-op if exists
+      update: {},
       create: { userId, name, isActive: true },
     });
   } catch (err) {
-    // Non-fatal – never break expense creation
     console.error('upsertManagedMerchant error:', err.message);
   }
 };
 
 // ==========================================
-// 1. AUTH ROUTES
+// 1. AUTH
 // ==========================================
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -177,7 +172,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // ==========================================
-// 2. EXPENSE ROUTES (⭐ UPDATED for merchant)
+// 2. EXPENSES
 // ==========================================
 app.get('/api/expenses', authenticateToken, async (req, res) => {
   try {
@@ -187,18 +182,16 @@ app.get('/api/expenses', authenticateToken, async (req, res) => {
     if (endDate) where.date = { ...where.date, lte: new Date(endDate) };
     if (categoryId) where.categoryId = categoryId;
     if (type) where.type = type;
-    if (merchant) where.merchant = merchant; // ⭐ exact match
+    if (merchant) where.merchant = merchant;
     if (search) {
       where.OR = [
         { note: { contains: search, mode: 'insensitive' } },
-        { merchant: { contains: search, mode: 'insensitive' } }, // ⭐
+        { merchant: { contains: search, mode: 'insensitive' } },
         { category: { name: { contains: search, mode: 'insensitive' } } },
       ];
     }
     const expenses = await prisma.expense.findMany({
-      where,
-      include: { category: true },
-      orderBy: { date: 'desc' },
+      where, include: { category: true }, orderBy: { date: 'desc' },
     });
     res.json(expenses);
   } catch (error) {
@@ -210,25 +203,18 @@ app.post('/api/expenses', authenticateToken, async (req, res) => {
   try {
     const { amount, date, note, merchant, categoryId, receiptUrl, isRecurring, type } = req.body;
     const normMerchant = normaliseMerchant(merchant);
-
     const expense = await prisma.expense.create({
       data: {
         amount: parseFloat(amount),
         date: date ? new Date(date) : new Date(),
-        note,
-        merchant: normMerchant,
-        receiptUrl,
+        note, merchant: normMerchant, receiptUrl,
         isRecurring: isRecurring || false,
         type: type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE',
-        userId: req.user.id,
-        categoryId,
+        userId: req.user.id, categoryId,
       },
       include: { category: true },
     });
-
-    // ⭐ Auto-add merchant to the managed list
     if (normMerchant) await upsertManagedMerchant(req.user.id, normMerchant);
-
     res.status(201).json(expense);
   } catch (error) {
     console.error(error);
@@ -240,7 +226,6 @@ app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
   try {
     const { amount, date, note, merchant, categoryId, receiptUrl, type } = req.body;
     const normMerchant = merchant !== undefined ? normaliseMerchant(merchant) : undefined;
-
     const expense = await prisma.expense.update({
       where: { id: req.params.id, userId: req.user.id },
       data: {
@@ -248,16 +233,12 @@ app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
         date: new Date(date),
         note,
         ...(merchant !== undefined && { merchant: normMerchant }),
-        categoryId,
-        receiptUrl,
+        categoryId, receiptUrl,
         ...(type && { type }),
       },
       include: { category: true },
     });
-
-    // ⭐ Auto-add merchant to the managed list
     if (normMerchant) await upsertManagedMerchant(req.user.id, normMerchant);
-
     res.json(expense);
   } catch (error) {
     res.status(500).json({ error: 'Failed to update expense.' });
@@ -273,13 +254,10 @@ app.delete('/api/expenses/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ⭐ UPDATED: CSV export now includes Merchant column
 app.get('/api/export/csv', authenticateToken, async (req, res) => {
   try {
     const expenses = await prisma.expense.findMany({
-      where: { userId: req.user.id },
-      include: { category: true },
-      orderBy: { date: 'desc' },
+      where: { userId: req.user.id }, include: { category: true }, orderBy: { date: 'desc' },
     });
     let csv = 'Date,Type,Category,Merchant,Amount,Note,Receipt\n';
     expenses.forEach((e) => {
@@ -296,10 +274,8 @@ app.get('/api/export/csv', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 3. ⭐ NEW: MERCHANT ROUTES
+// 3. MERCHANTS
 // ==========================================
-
-// Autocomplete list – unique merchants sorted by frequency
 app.get('/api/merchants', authenticateToken, async (req, res) => {
   try {
     const rows = await prisma.expense.findMany({
@@ -307,12 +283,103 @@ app.get('/api/merchants', authenticateToken, async (req, res) => {
       select: { merchant: true, date: true },
       orderBy: { date: 'desc' },
     });
+    const map = {};
+    rows.forEach((r) => {
+      const name = (r.merchant || '').trim();
+      if (!name) return;
+      if (!map[name]) map[name] = { name, count: 0, lastDate: r.date };
+      map[name].count += 1;
+      if (r.date > map[name].lastDate) map[name].lastDate = r.date;
+    });
+    res.json(Object.values(map).sort((a, b) => b.count - a.count));
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch merchants.' });
+  }
+});
 
-    // ==========================================
-// ⭐ NEW: Managed Merchant list CRUD
+app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
+  try {
+    const { month } = req.query;
+    let startDate, endDate, prevStartDate, prevEndDate;
+    if (month) {
+      const [y, m] = month.split('-').map(Number);
+      startDate = new Date(y, m - 1, 1);
+      endDate = new Date(y, m, 0, 23, 59, 59);
+      prevStartDate = new Date(y, m - 2, 1);
+      prevEndDate = new Date(y, m - 1, 0, 23, 59, 59);
+    } else {
+      const now = new Date();
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+      prevStartDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      prevEndDate = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+    }
+    const twelveMonthsAgo = new Date();
+    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+
+    const allRecent = await prisma.expense.findMany({
+      where: { userId: req.user.id, type: 'EXPENSE', merchant: { not: null }, date: { gte: twelveMonthsAgo } },
+      include: { category: true },
+      orderBy: { date: 'desc' },
+    });
+
+    const merchantMap = {};
+    allRecent.forEach((e) => {
+      const name = (e.merchant || '').trim();
+      if (!name) return;
+      if (!merchantMap[name]) {
+        merchantMap[name] = {
+          name, monthSpent: 0, monthCount: 0, prevMonthSpent: 0, prevMonthCount: 0,
+          allTimeSpent: 0, allTimeCount: 0, lastDate: e.date,
+          categoryCounts: {}, categoryIcons: {},
+        };
+      }
+      const m = merchantMap[name];
+      const amt = parseFloat(e.amount || 0);
+      m.allTimeSpent += amt;
+      m.allTimeCount += 1;
+      if (e.date > m.lastDate) m.lastDate = e.date;
+      const catName = e.category?.name || 'Uncategorized';
+      const catIcon = e.category?.icon || '📌';
+      m.categoryCounts[catName] = (m.categoryCounts[catName] || 0) + 1;
+      m.categoryIcons[catName] = catIcon;
+      if (e.date >= startDate && e.date <= endDate) { m.monthSpent += amt; m.monthCount += 1; }
+      if (e.date >= prevStartDate && e.date <= prevEndDate) { m.prevMonthSpent += amt; m.prevMonthCount += 1; }
+    });
+
+    const merchants = Object.values(merchantMap).map((m) => {
+      let primaryCategory = null, maxCount = 0;
+      Object.entries(m.categoryCounts).forEach(([name, count]) => {
+        if (count > maxCount) { maxCount = count; primaryCategory = { name, icon: m.categoryIcons[name] || '📌' }; }
+      });
+      let trend = 'flat';
+      if (m.prevMonthSpent === 0 && m.monthSpent > 0) trend = 'new';
+      else if (m.prevMonthSpent > 0) {
+        const change = ((m.monthSpent - m.prevMonthSpent) / m.prevMonthSpent) * 100;
+        if (change > 10) trend = 'up';
+        else if (change < -10) trend = 'down';
+      }
+      return {
+        name: m.name,
+        monthSpent: m.monthSpent, monthCount: m.monthCount,
+        monthAvg: m.monthCount > 0 ? m.monthSpent / m.monthCount : 0,
+        prevMonthSpent: m.prevMonthSpent,
+        allTimeSpent: m.allTimeSpent, allTimeCount: m.allTimeCount,
+        lastDate: m.lastDate, primaryCategory, trend,
+      };
+    }).filter((m) => m.monthCount > 0 || m.prevMonthCount > 0)
+      .sort((a, b) => b.monthSpent - a.monthSpent);
+
+    res.json({ month: startDate.toISOString().slice(0, 7), merchants });
+  } catch (error) {
+    console.error('Merchant stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch merchant stats.' });
+  }
+});
+
 // ==========================================
-
-// List all managed merchants
+// 4. MANAGED MERCHANT LIST
+// ==========================================
 app.get('/api/merchant-list', authenticateToken, async (req, res) => {
   try {
     const merchants = await prisma.merchant.findMany({
@@ -326,17 +393,12 @@ app.get('/api/merchant-list', authenticateToken, async (req, res) => {
   }
 });
 
-// Add a merchant to the managed list
 app.post('/api/merchant-list', authenticateToken, async (req, res) => {
   try {
     const { name, isActive } = req.body;
     if (!name || !name.trim()) return res.status(400).json({ error: 'Merchant name is required.' });
     const merchant = await prisma.merchant.create({
-      data: {
-        name: name.trim().slice(0, 100),
-        isActive: isActive !== false,
-        userId: req.user.id,
-      },
+      data: { name: name.trim().slice(0, 100), isActive: isActive !== false, userId: req.user.id },
     });
     res.status(201).json(merchant);
   } catch (error) {
@@ -346,7 +408,6 @@ app.post('/api/merchant-list', authenticateToken, async (req, res) => {
   }
 });
 
-// Update a merchant (rename or toggle active)
 app.put('/api/merchant-list/:id', authenticateToken, async (req, res) => {
   try {
     const { name, isActive } = req.body;
@@ -354,7 +415,6 @@ app.put('/api/merchant-list/:id', authenticateToken, async (req, res) => {
       where: { id: req.params.id, userId: req.user.id },
     });
     if (!existing) return res.status(404).json({ error: 'Merchant not found.' });
-
     const updated = await prisma.merchant.update({
       where: { id: req.params.id },
       data: {
@@ -370,7 +430,6 @@ app.put('/api/merchant-list/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete a merchant from the managed list
 app.delete('/api/merchant-list/:id', authenticateToken, async (req, res) => {
   try {
     await prisma.merchant.delete({ where: { id: req.params.id, userId: req.user.id } });
@@ -381,39 +440,29 @@ app.delete('/api/merchant-list/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// One-time: import all merchants already used in expenses
+// One-time import of merchants from existing expenses
 app.post('/api/merchant-list/import-existing', authenticateToken, async (req, res) => {
   try {
-    // Fetch all merchant names used in expenses (dedupe in JS)
     const rows = await prisma.expense.findMany({
-      where: {
-        userId: req.user.id,
-        merchant: { not: null },
-      },
+      where: { userId: req.user.id, merchant: { not: null } },
       select: { merchant: true },
     });
 
-    // Build unique set of non-empty names
     const uniqueNames = new Set();
     rows.forEach((r) => {
       const n = (r.merchant || '').trim();
       if (n) uniqueNames.add(n);
     });
 
-    // Fetch already-managed merchants
     const existing = await prisma.merchant.findMany({
       where: { userId: req.user.id },
       select: { name: true },
     });
     const existingSet = new Set(existing.map((m) => m.name));
 
-    let added = 0;
-    let skipped = 0;
+    let added = 0, skipped = 0;
     for (const name of uniqueNames) {
-      if (existingSet.has(name)) {
-        skipped++;
-        continue;
-      }
+      if (existingSet.has(name)) { skipped++; continue; }
       try {
         await prisma.merchant.create({
           data: { userId: req.user.id, name, isActive: true },
@@ -421,165 +470,19 @@ app.post('/api/merchant-list/import-existing', authenticateToken, async (req, re
         existingSet.add(name);
         added++;
       } catch (err) {
-        // Ignore individual insert failures (e.g., P2002 race), continue
         console.error(`Import skip for "${name}":`, err.message);
         skipped++;
       }
     }
-
     res.json({ message: 'Import complete', added, skipped });
   } catch (error) {
     console.error('Import merchants error:', error);
-    res.status(500).json({
-      error: 'Failed to import merchants.',
-      details: error.message,
-    });
-  }
-});
-
-    const map = {};
-    rows.forEach((r) => {
-      const name = (r.merchant || '').trim();
-      if (!name) return;
-      if (!map[name]) map[name] = { name, count: 0, lastDate: r.date };
-      map[name].count += 1;
-      if (r.date > map[name].lastDate) map[name].lastDate = r.date;
-    });
-
-    const merchants = Object.values(map).sort((a, b) => b.count - a.count);
-    res.json(merchants);
-  } catch (error) {
-    console.error('Fetch merchants error:', error);
-    res.status(500).json({ error: 'Failed to fetch merchants.' });
-  }
-});
-
-// Stats per merchant – for the Insights page and Top Merchants card
-app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
-  try {
-    const { month } = req.query;
-
-    // Determine current + previous month ranges
-    let startDate, endDate, prevStartDate, prevEndDate;
-    if (month) {
-      const [y, m] = month.split('-').map(Number);
-      startDate = new Date(y, m - 1, 1);
-      endDate = new Date(y, m, 0, 23, 59, 59);
-      prevStartDate = new Date(y, m - 2, 1);
-      prevEndDate = new Date(y, m - 1, 0, 23, 59, 59);
-    } else {
-      const now = new Date();
-      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-      endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
-      prevStartDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-      prevEndDate = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
-    }
-
-    // Last 12 months of expenses with merchant data
-    const twelveMonthsAgo = new Date();
-    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
-
-    const allRecent = await prisma.expense.findMany({
-      where: {
-        userId: req.user.id,
-        type: 'EXPENSE',
-        merchant: { not: null },
-        date: { gte: twelveMonthsAgo },
-      },
-      include: { category: true },
-      orderBy: { date: 'desc' },
-    });
-
-    const merchantMap = {};
-
-    allRecent.forEach((e) => {
-      const name = (e.merchant || '').trim();
-      if (!name) return;
-      if (!merchantMap[name]) {
-        merchantMap[name] = {
-          name,
-          monthSpent: 0,
-          monthCount: 0,
-          prevMonthSpent: 0,
-          prevMonthCount: 0,
-          allTimeSpent: 0,
-          allTimeCount: 0,
-          lastDate: e.date,
-          categoryCounts: {},
-          categoryIcons: {},
-        };
-      }
-      const m = merchantMap[name];
-      const amt = parseFloat(e.amount || 0);
-
-      m.allTimeSpent += amt;
-      m.allTimeCount += 1;
-      if (e.date > m.lastDate) m.lastDate = e.date;
-
-      const catName = e.category?.name || 'Uncategorized';
-      const catIcon = e.category?.icon || '📌';
-      m.categoryCounts[catName] = (m.categoryCounts[catName] || 0) + 1;
-      m.categoryIcons[catName] = catIcon;
-
-      if (e.date >= startDate && e.date <= endDate) {
-        m.monthSpent += amt;
-        m.monthCount += 1;
-      }
-      if (e.date >= prevStartDate && e.date <= prevEndDate) {
-        m.prevMonthSpent += amt;
-        m.prevMonthCount += 1;
-      }
-    });
-
-    const merchants = Object.values(merchantMap)
-      .map((m) => {
-        // Primary category = highest transaction count
-        let primaryCategory = null;
-        let maxCount = 0;
-        Object.entries(m.categoryCounts).forEach(([name, count]) => {
-          if (count > maxCount) {
-            maxCount = count;
-            primaryCategory = { name, icon: m.categoryIcons[name] || '📌' };
-          }
-        });
-
-        // Trend
-        let trend = 'flat';
-        if (m.prevMonthSpent === 0 && m.monthSpent > 0) trend = 'new';
-        else if (m.prevMonthSpent > 0) {
-          const change = ((m.monthSpent - m.prevMonthSpent) / m.prevMonthSpent) * 100;
-          if (change > 10) trend = 'up';
-          else if (change < -10) trend = 'down';
-        }
-
-        return {
-          name: m.name,
-          monthSpent: m.monthSpent,
-          monthCount: m.monthCount,
-          monthAvg: m.monthCount > 0 ? m.monthSpent / m.monthCount : 0,
-          prevMonthSpent: m.prevMonthSpent,
-          allTimeSpent: m.allTimeSpent,
-          allTimeCount: m.allTimeCount,
-          lastDate: m.lastDate,
-          primaryCategory,
-          trend,
-        };
-      })
-      .filter((m) => m.monthCount > 0 || m.prevMonthCount > 0) // only relevant merchants
-      .sort((a, b) => b.monthSpent - a.monthSpent);
-
-    res.json({
-      month: startDate.toISOString().slice(0, 7),
-      merchants,
-    });
-  } catch (error) {
-    console.error('Merchant stats error:', error);
-    res.status(500).json({ error: 'Failed to fetch merchant stats.' });
+    res.status(500).json({ error: 'Failed to import merchants.', details: error.message });
   }
 });
 
 // ==========================================
-// 4. INCOME ROUTES
+// 5. INCOME
 // ==========================================
 app.get('/api/incomes', authenticateToken, async (req, res) => {
   try {
@@ -605,11 +508,8 @@ app.post('/api/incomes', authenticateToken, async (req, res) => {
     if (!amount || parseFloat(amount) <= 0) return res.status(400).json({ error: 'A positive amount is required.' });
     const income = await prisma.income.create({
       data: {
-        amount: parseFloat(amount),
-        date: date ? new Date(date) : new Date(),
-        note,
-        source: source || 'SALARY',
-        userId: req.user.id,
+        amount: parseFloat(amount), date: date ? new Date(date) : new Date(),
+        note, source: source || 'SALARY', userId: req.user.id,
       },
     });
     res.status(201).json(income);
@@ -628,7 +528,7 @@ app.delete('/api/incomes/:id', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 5. DASHBOARD SUMMARY
+// 6. DASHBOARD SUMMARY
 // ==========================================
 app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
   try {
@@ -643,38 +543,27 @@ app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
       startDate = new Date(now.getFullYear(), now.getMonth(), 1);
       endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
     }
-
     const [incomes, expenseRows, savingsRows] = await Promise.all([
       prisma.income.findMany({ where: { userId: req.user.id, date: { gte: startDate, lte: endDate } } }),
-      prisma.expense.findMany({
-        where: { userId: req.user.id, type: 'EXPENSE', date: { gte: startDate, lte: endDate } },
-        include: { category: true },
-      }),
-      prisma.expense.findMany({
-        where: { userId: req.user.id, type: 'SAVINGS', date: { gte: startDate, lte: endDate } },
-        include: { category: true },
-      }),
+      prisma.expense.findMany({ where: { userId: req.user.id, type: 'EXPENSE', date: { gte: startDate, lte: endDate } }, include: { category: true } }),
+      prisma.expense.findMany({ where: { userId: req.user.id, type: 'SAVINGS', date: { gte: startDate, lte: endDate } }, include: { category: true } }),
     ]);
-
     const sumOf = (arr) => arr.reduce((s, r) => s + parseFloat(r.amount || 0), 0);
     const totalIncome = sumOf(incomes);
     const spent = sumOf(expenseRows);
     const saved = sumOf(savingsRows);
     const unspent = totalIncome - spent - saved;
     const savingsRate = totalIncome > 0 ? (saved / totalIncome) * 100 : 0;
-
     const breakdown = {};
     savingsRows.forEach((r) => {
       const name = r.category?.name || 'Uncategorized';
       breakdown[name] = (breakdown[name] || 0) + parseFloat(r.amount || 0);
     });
-
     const expenseBreakdown = {};
     expenseRows.forEach((r) => {
       const name = r.category?.name || 'Uncategorized';
       expenseBreakdown[name] = (expenseBreakdown[name] || 0) + parseFloat(r.amount || 0);
     });
-
     res.json({
       month: startDate.toISOString().slice(0, 7),
       income: totalIncome, spent, saved, unspent,
@@ -690,7 +579,7 @@ app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 6. CATEGORY ROUTES
+// 7. CATEGORIES
 // ==========================================
 app.get('/api/categories', authenticateToken, async (req, res) => {
   try {
@@ -748,8 +637,7 @@ app.post('/api/seed-savings-categories', authenticateToken, async (req, res) => 
       { name: 'Emergency Fund', icon: '🛟', color: '#E74C3C', type: 'SAVINGS' },
       { name: 'Stocks',         icon: '📊', color: '#3498DB', type: 'SAVINGS' },
     ];
-    const created = [];
-    const skipped = [];
+    const created = [], skipped = [];
     for (const cat of savingsDefaults) {
       const existing = await prisma.category.findFirst({ where: { userId: req.user.id, name: cat.name } });
       if (existing) {
@@ -770,7 +658,7 @@ app.post('/api/seed-savings-categories', authenticateToken, async (req, res) => 
 });
 
 // ==========================================
-// 7. BUDGET ROUTES
+// 8. BUDGETS
 // ==========================================
 app.get('/api/budgets', authenticateToken, async (req, res) => {
   try {
@@ -832,18 +720,16 @@ app.delete('/api/budgets/:id', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 8. RECURRING RULES
+// 9. RECURRING RULES
 // ==========================================
 app.get('/api/recurring-rules', authenticateToken, async (req, res) => {
   try {
     const rules = await prisma.recurringRule.findMany({
-      where: { userId: req.user.id },
-      include: { category: true },
+      where: { userId: req.user.id }, include: { category: true },
       orderBy: [{ isActive: 'desc' }, { nextExecution: 'asc' }],
     });
     res.json(rules);
   } catch (error) {
-    console.error(error);
     res.status(500).json({ error: 'Failed to fetch recurring rules.' });
   }
 });
@@ -860,15 +746,10 @@ app.post('/api/recurring-rules', authenticateToken, async (req, res) => {
     const nextExecution = computeNextExecution(frequency, dayOfMonth, dayOfWeek);
     const rule = await prisma.recurringRule.create({
       data: {
-        description: description.trim(),
-        amount: parseFloat(amount),
-        frequency,
+        description: description.trim(), amount: parseFloat(amount), frequency,
         dayOfMonth: dayOfMonth ? parseInt(dayOfMonth) : null,
         dayOfWeek: dayOfWeek !== undefined && dayOfWeek !== null && dayOfWeek !== '' ? parseInt(dayOfWeek) : null,
-        nextExecution,
-        isActive: true,
-        userId: req.user.id,
-        categoryId,
+        nextExecution, isActive: true, userId: req.user.id, categoryId,
       },
       include: { category: true },
     });
@@ -882,16 +763,12 @@ app.post('/api/recurring-rules', authenticateToken, async (req, res) => {
 app.put('/api/recurring-rules/:id', authenticateToken, async (req, res) => {
   try {
     const { description, amount, frequency, dayOfMonth, dayOfWeek, categoryId, isActive } = req.body;
-    const existing = await prisma.recurringRule.findFirst({
-      where: { id: req.params.id, userId: req.user.id },
-    });
+    const existing = await prisma.recurringRule.findFirst({ where: { id: req.params.id, userId: req.user.id } });
     if (!existing) return res.status(404).json({ error: 'Recurring rule not found.' });
-
     const newFrequency = frequency || existing.frequency;
     const newDayOfMonth = dayOfMonth !== undefined ? (dayOfMonth ? parseInt(dayOfMonth) : null) : existing.dayOfMonth;
     const newDayOfWeek = dayOfWeek !== undefined ? (dayOfWeek !== null && dayOfWeek !== '' ? parseInt(dayOfWeek) : null) : existing.dayOfWeek;
     const shouldRecompute = frequency !== undefined || dayOfMonth !== undefined || dayOfWeek !== undefined;
-
     const rule = await prisma.recurringRule.update({
       where: { id: req.params.id },
       data: {
@@ -902,9 +779,7 @@ app.put('/api/recurring-rules/:id', authenticateToken, async (req, res) => {
         ...(dayOfWeek !== undefined && { dayOfWeek: newDayOfWeek }),
         ...(categoryId && { categoryId }),
         ...(isActive !== undefined && { isActive }),
-        ...(shouldRecompute && {
-          nextExecution: computeNextExecution(newFrequency, newDayOfMonth, newDayOfWeek),
-        }),
+        ...(shouldRecompute && { nextExecution: computeNextExecution(newFrequency, newDayOfMonth, newDayOfWeek) }),
       },
       include: { category: true },
     });
@@ -917,11 +792,8 @@ app.put('/api/recurring-rules/:id', authenticateToken, async (req, res) => {
 
 app.patch('/api/recurring-rules/:id/toggle', authenticateToken, async (req, res) => {
   try {
-    const existing = await prisma.recurringRule.findFirst({
-      where: { id: req.params.id, userId: req.user.id },
-    });
+    const existing = await prisma.recurringRule.findFirst({ where: { id: req.params.id, userId: req.user.id } });
     if (!existing) return res.status(404).json({ error: 'Recurring rule not found.' });
-
     const updated = await prisma.recurringRule.update({
       where: { id: req.params.id },
       data: { isActive: !existing.isActive },
@@ -929,7 +801,6 @@ app.patch('/api/recurring-rules/:id/toggle', authenticateToken, async (req, res)
     });
     res.json(updated);
   } catch (error) {
-    console.error(error);
     res.status(500).json({ error: 'Failed to toggle recurring rule.' });
   }
 });
@@ -944,7 +815,7 @@ app.delete('/api/recurring-rules/:id', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 9. RECURRING CRON JOB (⭐ UPDATED: merchant = description)
+// 10. RECURRING CRON
 // ==========================================
 const processRecurringExpenses = async () => {
   console.log('🔄 Running recurring job...');
@@ -959,19 +830,18 @@ const processRecurringExpenses = async () => {
   for (const rule of rules) {
     try {
       const entryType = rule.category?.type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE';
+      const normMerchant = normaliseMerchant(rule.description);
 
       await prisma.expense.create({
         data: {
-          amount: rule.amount,
-          date: today,
+          amount: rule.amount, date: today,
           note: `${rule.description} (Auto - Recurring)`,
-          merchant: normaliseMerchant(rule.description), // ⭐
-          isRecurring: true,
-          type: entryType,
-          userId: rule.userId,
-          categoryId: rule.categoryId,
+          merchant: normMerchant,
+          isRecurring: true, type: entryType,
+          userId: rule.userId, categoryId: rule.categoryId,
         },
       });
+      if (normMerchant) await upsertManagedMerchant(rule.userId, normMerchant);
 
       let nextExec = new Date(today);
       if (rule.frequency === 'DAILY') nextExec.setDate(today.getDate() + 1);
@@ -982,15 +852,9 @@ const processRecurringExpenses = async () => {
           nextExec.setDate(rule.dayOfMonth);
           if (nextExec.getDate() !== rule.dayOfMonth) nextExec.setDate(0);
         }
-      } else if (rule.frequency === 'YEARLY') {
-        nextExec.setFullYear(today.getFullYear() + 1);
-      }
+      } else if (rule.frequency === 'YEARLY') nextExec.setFullYear(today.getFullYear() + 1);
 
-      await prisma.recurringRule.update({
-        where: { id: rule.id },
-        data: { nextExecution: nextExec },
-      });
-
+      await prisma.recurringRule.update({ where: { id: rule.id }, data: { nextExecution: nextExec } });
       console.log(`✅ Auto-created ${entryType} for "${rule.description}"`);
     } catch (error) {
       console.error(`❌ Failed to process recurring rule ${rule.id}:`, error);
@@ -1002,7 +866,7 @@ cron.schedule('30 18 * * *', processRecurringExpenses);
 setTimeout(processRecurringExpenses, 10000);
 
 // ==========================================
-// 10. GMAIL INTEGRATION (⭐ UPDATED: save merchant)
+// 11. GMAIL
 // ==========================================
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -1030,12 +894,8 @@ const processGmailReceipts = async (userId) => {
   if (!user.gmailRefreshToken) return console.log(`❌ No Gmail refresh token for user ${userId}`);
 
   oauth2Client.setCredentials({ refresh_token: user.gmailRefreshToken });
-  try {
-    await oauth2Client.refreshAccessToken();
-    console.log('✅ Access token refreshed successfully');
-  } catch (error) {
-    return console.error('❌ Failed to refresh access token:', error.message);
-  }
+  try { await oauth2Client.refreshAccessToken(); }
+  catch (error) { return console.error('❌ Failed to refresh access token:', error.message); }
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
   const sevenDaysAgo = new Date();
@@ -1046,7 +906,6 @@ const processGmailReceipts = async (userId) => {
   try {
     const res = await gmail.users.messages.list({ userId: 'me', q: query, maxResults: 50 });
     messages = res.data.messages || [];
-    console.log(`📬 Found ${messages.length} matching emails`);
   } catch (error) {
     console.error('❌ Gmail API list error:', error.message);
     throw error;
@@ -1055,19 +914,15 @@ const processGmailReceipts = async (userId) => {
   if (messages.length === 0) return;
 
   let defaultCategory;
-  try {
-    defaultCategory = await getUserDefaultCategory(userId);
-  } catch (error) {
-    return console.error('❌ Failed to get default category:', error.message);
-  }
+  try { defaultCategory = await getUserDefaultCategory(userId); }
+  catch (error) { return console.error('❌ Failed to get default category:', error.message); }
 
   let importedCount = 0;
   for (const msg of messages) {
     try {
       const msgData = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'full' });
       const payload = msgData.data.payload;
-      let subject = '';
-      let body = '';
+      let subject = '', body = '';
       const headers = payload.headers;
       headers.forEach((h) => { if (h.name === 'Subject') subject = h.value; });
 
@@ -1125,7 +980,6 @@ const processGmailReceipts = async (userId) => {
       });
       if (existing) continue;
 
-      // ⭐ Detect merchant name from sender
       let merchantName = 'Unknown';
       if (sender.includes('amazonpay')) merchantName = 'Amazon Pay';
       else if (sender.includes('amazon')) merchantName = 'Amazon';
@@ -1140,11 +994,12 @@ const processGmailReceipts = async (userId) => {
         data: {
           amount, date: new Date(parseInt(msgData.data.internalDate)),
           note: `Auto-import: ${subject}`,
-          merchant: merchantName, // ⭐
-          isRecurring: false,
-          type: 'EXPENSE', userId, categoryId: defaultCategory.id,
+          merchant: merchantName,
+          isRecurring: false, type: 'EXPENSE',
+          userId, categoryId: defaultCategory.id,
         },
       });
+      await upsertManagedMerchant(userId, merchantName);
       importedCount++;
     } catch (error) {
       console.error(`❌ Error processing email ${msg.id}:`, error.message);
@@ -1189,7 +1044,7 @@ app.get('/api/auth/gmail/status', authenticateToken, async (req, res) => {
 app.post('/api/gmail/sync', authenticateToken, async (req, res) => {
   try {
     await processGmailReceipts(req.user.id);
-    res.json({ message: 'Gmail sync completed successfully! Check your expenses.' });
+    res.json({ message: 'Gmail sync completed successfully!' });
   } catch (error) {
     console.error('Manual sync error:', error);
     res.status(500).json({ error: 'Sync failed. Check logs for details.' });
@@ -1197,7 +1052,7 @@ app.post('/api/gmail/sync', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 11. PENDING IMPORTS (⭐ UPDATED: carry merchant through)
+// 12. PENDING IMPORTS
 // ==========================================
 app.get('/api/pending', authenticateToken, async (req, res) => {
   try {
@@ -1217,11 +1072,8 @@ app.put('/api/pending/:id', authenticateToken, async (req, res) => {
     const pending = await prisma.pendingImport.update({
       where: { id: req.params.id, userId: req.user.id },
       data: {
-        amount: parseFloat(amount),
-        merchant,
-        date: new Date(date),
-        note,
-        categoryId: categoryId || null,
+        amount: parseFloat(amount), merchant, date: new Date(date),
+        note, categoryId: categoryId || null,
       },
       include: { category: true },
     });
@@ -1255,16 +1107,14 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
     }
     const expense = await prisma.expense.create({
       data: {
-        amount: pending.amount,
-        date: pending.date,
+        amount: pending.amount, date: pending.date,
         note: pending.note || pending.merchant,
-        merchant: pending.merchant, // ⭐
-        categoryId: finalCategoryId,
-        userId: req.user.id,
-        isRecurring: false,
-        type: 'EXPENSE',
+        merchant: pending.merchant,
+        categoryId: finalCategoryId, userId: req.user.id,
+        isRecurring: false, type: 'EXPENSE',
       },
     });
+    if (pending.merchant) await upsertManagedMerchant(req.user.id, pending.merchant);
     await prisma.pendingImport.update({ where: { id: pending.id }, data: { status: 'confirmed' } });
     res.json({ message: 'Expense created from pending import.', expense });
   } catch (error) {
@@ -1274,7 +1124,7 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 12. KEEP-ALIVE + START
+// 13. PING + START
 // ==========================================
 app.get('/ping', (req, res) => res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() }));
 
