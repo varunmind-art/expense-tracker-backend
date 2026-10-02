@@ -88,11 +88,9 @@ const normaliseMerchant = (m) => {
   return trimmed.slice(0, 100);
 };
 
-// ⭐ Resolve merchant name to canonical (looks up aliases)
 const resolveMerchantAlias = async (userId, inputName) => {
   const name = normaliseMerchant(inputName);
   if (!name) return null;
-
   const match = await prisma.merchant.findFirst({
     where: {
       userId,
@@ -105,15 +103,11 @@ const resolveMerchantAlias = async (userId, inputName) => {
   return match ? match.name : name;
 };
 
-// ⭐ Auto-register merchant into the managed list (idempotent)
 const upsertManagedMerchant = async (userId, merchantName) => {
   const name = normaliseMerchant(merchantName);
   if (!name) return;
-
-  // If an alias exists pointing to an existing merchant, don't create a new one
   const resolved = await resolveMerchantAlias(userId, name);
-  if (resolved !== name) return; // already known via alias
-
+  if (resolved !== name) return;
   try {
     await prisma.merchant.upsert({
       where: { userId_name: { userId, name } },
@@ -325,7 +319,7 @@ app.get('/api/merchants', authenticateToken, async (req, res) => {
   }
 });
 
-// ⭐ Merchant stats with alias resolution
+// ⭐ Merchant stats with alias resolution + category breakdown
 app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
   try {
     const { month } = req.query;
@@ -373,7 +367,7 @@ app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
         merchantMap[name] = {
           name, monthSpent: 0, monthCount: 0, prevMonthSpent: 0, prevMonthCount: 0,
           allTimeSpent: 0, allTimeCount: 0, lastDate: e.date,
-          categoryCounts: {}, categoryIcons: {},
+          categoryCounts: {}, categoryIcons: {}, categoryAmounts: {},
         };
       }
       const m = merchantMap[name];
@@ -384,6 +378,7 @@ app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
       const catName = e.category?.name || 'Uncategorized';
       const catIcon = e.category?.icon || '📌';
       m.categoryCounts[catName] = (m.categoryCounts[catName] || 0) + 1;
+      m.categoryAmounts[catName] = (m.categoryAmounts[catName] || 0) + amt;
       m.categoryIcons[catName] = catIcon;
       if (e.date >= startDate && e.date <= endDate) { m.monthSpent += amt; m.monthCount += 1; }
       if (e.date >= prevStartDate && e.date <= prevEndDate) { m.prevMonthSpent += amt; m.prevMonthCount += 1; }
@@ -408,6 +403,16 @@ app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
         prevMonthSpent: m.prevMonthSpent,
         allTimeSpent: m.allTimeSpent, allTimeCount: m.allTimeCount,
         lastDate: m.lastDate, primaryCategory, trend,
+        // ⭐ Category correlation breakdown
+        categoryBreakdown: Object.entries(m.categoryAmounts)
+          .map(([name, amount]) => ({
+            name,
+            icon: m.categoryIcons[name] || '📌',
+            amount,
+            count: m.categoryCounts[name] || 0,
+            pct: m.allTimeSpent > 0 ? (amount / m.allTimeSpent) * 100 : 0,
+          }))
+          .sort((a, b) => b.amount - a.amount),
       };
     }).filter((m) => m.monthCount > 0 || m.prevMonthCount > 0)
       .sort((a, b) => b.monthSpent - a.monthSpent);
@@ -427,7 +432,6 @@ app.get('/api/merchants/transactions', authenticateToken, async (req, res) => {
 
     const take = Math.min(parseInt(limit) || 10, 50);
 
-    // Find the merchant record to get its aliases
     const merchant = await prisma.merchant.findFirst({
       where: { userId: req.user.id, name },
     });
@@ -448,6 +452,88 @@ app.get('/api/merchants/transactions', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Merchant transactions error:', error);
     res.status(500).json({ error: 'Failed to fetch transactions.' });
+  }
+});
+
+// ⭐ Merchant Frequency: heatmap data (week × day of week) + hour
+app.get('/api/merchants/frequency', authenticateToken, async (req, res) => {
+  try {
+    const { name } = req.query;
+    if (!name) return res.status(400).json({ error: 'Merchant name is required.' });
+
+    // Resolve aliases so all variants are included
+    const merchantRec = await prisma.merchant.findFirst({
+      where: { userId: req.user.id, name },
+    });
+    const aliases = merchantRec?.aliases || [];
+    const namesToMatch = [name, ...aliases];
+
+    const expenses = await prisma.expense.findMany({
+      where: {
+        userId: req.user.id,
+        merchant: { in: namesToMatch },
+        type: 'EXPENSE',
+      },
+      orderBy: { date: 'desc' },
+    });
+
+    // 5 weeks × 7 days of week grid
+    const matrix = Array.from({ length: 5 }, () => Array(7).fill(0));
+    const amountMatrix = Array.from({ length: 5 }, () => Array(7).fill(0));
+    const byDayOfWeek = Array(7).fill(0);
+    const byWeekOfMonth = Array(5).fill(0);
+    const byHour = Array(24).fill(0);
+
+    let totalVisits = 0;
+    let totalAmount = 0;
+    let earliestDate = null;
+    let latestDate = null;
+
+    expenses.forEach((e) => {
+      const d = new Date(e.date);
+      const dow = d.getDay();
+      const dayOfMonth = d.getDate();
+      const wk = Math.min(4, Math.floor((dayOfMonth - 1) / 7));
+      const amt = parseFloat(e.amount || 0);
+
+      matrix[wk][dow] += 1;
+      amountMatrix[wk][dow] += amt;
+      byDayOfWeek[dow] += 1;
+      byWeekOfMonth[wk] += 1;
+      byHour[d.getHours()] += 1;
+      totalVisits += 1;
+      totalAmount += amt;
+
+      if (!earliestDate || d < earliestDate) earliestDate = d;
+      if (!latestDate || d > latestDate) latestDate = d;
+    });
+
+    const maxDow = Math.max(...byDayOfWeek);
+    const busiestDowIndex = byDayOfWeek.indexOf(maxDow);
+    const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+    const maxHour = Math.max(...byHour);
+    const busiestHourIndex = byHour.indexOf(maxHour);
+
+    res.json({
+      merchant: name,
+      aliases,
+      totalVisits,
+      totalAmount,
+      avgPerVisit: totalVisits > 0 ? totalAmount / totalVisits : 0,
+      earliestDate,
+      latestDate,
+      matrix,
+      amountMatrix,
+      byDayOfWeek,
+      byWeekOfMonth,
+      byHour,
+      busiestDay: maxDow > 0 ? DAY_NAMES[busiestDowIndex] : null,
+      busiestHour: maxHour > 0 ? busiestHourIndex : null,
+    });
+  } catch (error) {
+    console.error('Frequency error:', error);
+    res.status(500).json({ error: 'Failed to fetch frequency.' });
   }
 });
 
@@ -514,7 +600,6 @@ app.delete('/api/merchant-list/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// One-time import of merchants from existing expenses
 app.post('/api/merchant-list/import-existing', authenticateToken, async (req, res) => {
   try {
     const rows = await prisma.expense.findMany({
@@ -555,7 +640,6 @@ app.post('/api/merchant-list/import-existing', authenticateToken, async (req, re
   }
 });
 
-// ⭐ Add an alias to a merchant
 app.post('/api/merchant-list/:id/aliases', authenticateToken, async (req, res) => {
   try {
     const { alias } = req.body;
@@ -567,7 +651,6 @@ app.post('/api/merchant-list/:id/aliases', authenticateToken, async (req, res) =
     });
     if (!merchant) return res.status(404).json({ error: 'Merchant not found.' });
 
-    // Check if alias already exists on another merchant
     const conflict = await prisma.merchant.findFirst({
       where: {
         userId: req.user.id,
@@ -582,7 +665,6 @@ app.post('/api/merchant-list/:id/aliases', authenticateToken, async (req, res) =
       return res.status(409).json({ error: `"${cleanAlias}" already belongs to ${conflict.name}.` });
     }
 
-    // Already an alias on this merchant?
     if (merchant.aliases.includes(cleanAlias)) {
       return res.json(merchant);
     }
@@ -598,7 +680,6 @@ app.post('/api/merchant-list/:id/aliases', authenticateToken, async (req, res) =
   }
 });
 
-// ⭐ Remove an alias from a merchant
 app.delete('/api/merchant-list/:id/aliases/:alias', authenticateToken, async (req, res) => {
   try {
     const alias = decodeURIComponent(req.params.alias);
@@ -1130,7 +1211,6 @@ const processGmailReceipts = async (userId) => {
       else if (sender.includes('icici')) merchantName = 'ICICI Bank';
       else if (sender.includes('yesbank')) merchantName = 'YES Bank';
 
-      // ⭐ Resolve via aliases
       const resolvedMerchant = await resolveMerchantAlias(userId, merchantName);
 
       await prisma.expense.create({
@@ -1249,7 +1329,6 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
       finalCategoryId = fallback.id;
     }
 
-    // ⭐ Resolve merchant via aliases
     const resolvedMerchant = pending.merchant
       ? await resolveMerchantAlias(req.user.id, pending.merchant)
       : null;
