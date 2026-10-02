@@ -384,12 +384,23 @@ app.delete('/api/merchant-list/:id', authenticateToken, async (req, res) => {
 // One-time: import all merchants already used in expenses
 app.post('/api/merchant-list/import-existing', authenticateToken, async (req, res) => {
   try {
+    // Fetch all merchant names used in expenses (dedupe in JS)
     const rows = await prisma.expense.findMany({
-      where: { userId: req.user.id, merchant: { not: null } },
+      where: {
+        userId: req.user.id,
+        merchant: { not: null },
+      },
       select: { merchant: true },
-      distinct: ['merchant'],
     });
 
+    // Build unique set of non-empty names
+    const uniqueNames = new Set();
+    rows.forEach((r) => {
+      const n = (r.merchant || '').trim();
+      if (n) uniqueNames.add(n);
+    });
+
+    // Fetch already-managed merchants
     const existing = await prisma.merchant.findMany({
       where: { userId: req.user.id },
       select: { name: true },
@@ -398,9 +409,7 @@ app.post('/api/merchant-list/import-existing', authenticateToken, async (req, re
 
     let added = 0;
     let skipped = 0;
-    for (const r of rows) {
-      const name = (r.merchant || '').trim();
-      if (!name) continue;
+    for (const name of uniqueNames) {
       if (existingSet.has(name)) {
         skipped++;
         continue;
@@ -412,13 +421,19 @@ app.post('/api/merchant-list/import-existing', authenticateToken, async (req, re
         existingSet.add(name);
         added++;
       } catch (err) {
-        // Ignore P2002 (already added in loop) and other non-fatal errors
+        // Ignore individual insert failures (e.g., P2002 race), continue
+        console.error(`Import skip for "${name}":`, err.message);
+        skipped++;
       }
     }
+
     res.json({ message: 'Import complete', added, skipped });
   } catch (error) {
     console.error('Import merchants error:', error);
-    res.status(500).json({ error: 'Failed to import merchants.' });
+    res.status(500).json({
+      error: 'Failed to import merchants.',
+      details: error.message,
+    });
   }
 });
 
