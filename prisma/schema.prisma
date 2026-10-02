@@ -47,6 +47,7 @@ model Expense {
   amount      Decimal  @db.Decimal(10, 2)
   date        DateTime @default(now())
   note        String?
+  merchant    String?  // ⭐ NEW
   receiptUrl  String?
   isRecurring Boolean  @default(false)
   type        String   @default("EXPENSE") // EXPENSE | SAVINGS

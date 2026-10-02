@@ -63,12 +63,10 @@ const getUserDefaultCategory = async (userId) => {
   return category;
 };
 
-// ⭐ NEW: Compute next execution for a recurring rule
 const computeNextExecution = (frequency, dayOfMonth, dayOfWeek) => {
   const now = new Date();
   now.setHours(0, 0, 0, 0);
   const next = new Date(now);
-
   if (frequency === 'DAILY') {
     next.setDate(now.getDate() + 1);
   } else if (frequency === 'WEEKLY') {
@@ -86,9 +84,13 @@ const computeNextExecution = (frequency, dayOfMonth, dayOfWeek) => {
   return next;
 };
 
-// ⭐ NEW: Given a rule, compute the *next* execution from today
-const computeNextAfterNow = (rule) => {
-  return computeNextExecution(rule.frequency, rule.dayOfMonth, rule.dayOfWeek);
+// ⭐ NEW: Normalise merchant string
+const normaliseMerchant = (m) => {
+  if (m === null || m === undefined) return null;
+  const trimmed = String(m).trim();
+  if (!trimmed) return null;
+  // Cap length to prevent abuse
+  return trimmed.slice(0, 100);
 };
 
 // ==========================================
@@ -160,24 +162,28 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // ==========================================
-// 2. EXPENSE ROUTES
+// 2. EXPENSE ROUTES (⭐ UPDATED for merchant)
 // ==========================================
 app.get('/api/expenses', authenticateToken, async (req, res) => {
   try {
-    const { startDate, endDate, categoryId, search, type } = req.query;
+    const { startDate, endDate, categoryId, search, type, merchant } = req.query;
     const where = { userId: req.user.id };
     if (startDate) where.date = { ...where.date, gte: new Date(startDate) };
     if (endDate) where.date = { ...where.date, lte: new Date(endDate) };
     if (categoryId) where.categoryId = categoryId;
     if (type) where.type = type;
+    if (merchant) where.merchant = merchant; // ⭐ exact match
     if (search) {
       where.OR = [
         { note: { contains: search, mode: 'insensitive' } },
+        { merchant: { contains: search, mode: 'insensitive' } }, // ⭐
         { category: { name: { contains: search, mode: 'insensitive' } } },
       ];
     }
     const expenses = await prisma.expense.findMany({
-      where, include: { category: true }, orderBy: { date: 'desc' },
+      where,
+      include: { category: true },
+      orderBy: { date: 'desc' },
     });
     res.json(expenses);
   } catch (error) {
@@ -187,12 +193,14 @@ app.get('/api/expenses', authenticateToken, async (req, res) => {
 
 app.post('/api/expenses', authenticateToken, async (req, res) => {
   try {
-    const { amount, date, note, categoryId, receiptUrl, isRecurring, type } = req.body;
+    const { amount, date, note, merchant, categoryId, receiptUrl, isRecurring, type } = req.body;
     const expense = await prisma.expense.create({
       data: {
         amount: parseFloat(amount),
         date: date ? new Date(date) : new Date(),
-        note, receiptUrl,
+        note,
+        merchant: normaliseMerchant(merchant), // ⭐
+        receiptUrl,
         isRecurring: isRecurring || false,
         type: type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE',
         userId: req.user.id,
@@ -209,13 +217,16 @@ app.post('/api/expenses', authenticateToken, async (req, res) => {
 
 app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
   try {
-    const { amount, date, note, categoryId, receiptUrl, type } = req.body;
+    const { amount, date, note, merchant, categoryId, receiptUrl, type } = req.body;
     const expense = await prisma.expense.update({
       where: { id: req.params.id, userId: req.user.id },
       data: {
         amount: parseFloat(amount),
         date: new Date(date),
-        note, categoryId, receiptUrl,
+        note,
+        ...(merchant !== undefined && { merchant: normaliseMerchant(merchant) }), // ⭐
+        categoryId,
+        receiptUrl,
         ...(type && { type }),
       },
       include: { category: true },
@@ -235,14 +246,19 @@ app.delete('/api/expenses/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ⭐ UPDATED: CSV export now includes Merchant column
 app.get('/api/export/csv', authenticateToken, async (req, res) => {
   try {
     const expenses = await prisma.expense.findMany({
-      where: { userId: req.user.id }, include: { category: true }, orderBy: { date: 'desc' },
+      where: { userId: req.user.id },
+      include: { category: true },
+      orderBy: { date: 'desc' },
     });
-    let csv = 'Date,Type,Category,Amount,Note,Receipt\n';
+    let csv = 'Date,Type,Category,Merchant,Amount,Note,Receipt\n';
     expenses.forEach((e) => {
-      csv += `${e.date.toISOString().split('T')[0]},${e.type || 'EXPENSE'},${e.category.name},${e.amount},${e.note || ''},${e.receiptUrl || ''}\n`;
+      const merchant = (e.merchant || '').replace(/,/g, ';');
+      const note = (e.note || '').replace(/,/g, ';');
+      csv += `${e.date.toISOString().split('T')[0]},${e.type || 'EXPENSE'},${e.category.name},${merchant},${e.amount},${note},${e.receiptUrl || ''}\n`;
     });
     res.header('Content-Type', 'text/csv');
     res.attachment('expenses_export.csv');
@@ -253,7 +269,161 @@ app.get('/api/export/csv', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 3. INCOME ROUTES
+// 3. ⭐ NEW: MERCHANT ROUTES
+// ==========================================
+
+// Autocomplete list – unique merchants sorted by frequency
+app.get('/api/merchants', authenticateToken, async (req, res) => {
+  try {
+    const rows = await prisma.expense.findMany({
+      where: { userId: req.user.id, merchant: { not: null } },
+      select: { merchant: true, date: true },
+      orderBy: { date: 'desc' },
+    });
+
+    const map = {};
+    rows.forEach((r) => {
+      const name = (r.merchant || '').trim();
+      if (!name) return;
+      if (!map[name]) map[name] = { name, count: 0, lastDate: r.date };
+      map[name].count += 1;
+      if (r.date > map[name].lastDate) map[name].lastDate = r.date;
+    });
+
+    const merchants = Object.values(map).sort((a, b) => b.count - a.count);
+    res.json(merchants);
+  } catch (error) {
+    console.error('Fetch merchants error:', error);
+    res.status(500).json({ error: 'Failed to fetch merchants.' });
+  }
+});
+
+// Stats per merchant – for the Insights page and Top Merchants card
+app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
+  try {
+    const { month } = req.query;
+
+    // Determine current + previous month ranges
+    let startDate, endDate, prevStartDate, prevEndDate;
+    if (month) {
+      const [y, m] = month.split('-').map(Number);
+      startDate = new Date(y, m - 1, 1);
+      endDate = new Date(y, m, 0, 23, 59, 59);
+      prevStartDate = new Date(y, m - 2, 1);
+      prevEndDate = new Date(y, m - 1, 0, 23, 59, 59);
+    } else {
+      const now = new Date();
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+      prevStartDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      prevEndDate = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+    }
+
+    // Last 12 months of expenses with merchant data
+    const twelveMonthsAgo = new Date();
+    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+
+    const allRecent = await prisma.expense.findMany({
+      where: {
+        userId: req.user.id,
+        type: 'EXPENSE',
+        merchant: { not: null },
+        date: { gte: twelveMonthsAgo },
+      },
+      include: { category: true },
+      orderBy: { date: 'desc' },
+    });
+
+    const merchantMap = {};
+
+    allRecent.forEach((e) => {
+      const name = (e.merchant || '').trim();
+      if (!name) return;
+      if (!merchantMap[name]) {
+        merchantMap[name] = {
+          name,
+          monthSpent: 0,
+          monthCount: 0,
+          prevMonthSpent: 0,
+          prevMonthCount: 0,
+          allTimeSpent: 0,
+          allTimeCount: 0,
+          lastDate: e.date,
+          categoryCounts: {},
+          categoryIcons: {},
+        };
+      }
+      const m = merchantMap[name];
+      const amt = parseFloat(e.amount || 0);
+
+      m.allTimeSpent += amt;
+      m.allTimeCount += 1;
+      if (e.date > m.lastDate) m.lastDate = e.date;
+
+      const catName = e.category?.name || 'Uncategorized';
+      const catIcon = e.category?.icon || '📌';
+      m.categoryCounts[catName] = (m.categoryCounts[catName] || 0) + 1;
+      m.categoryIcons[catName] = catIcon;
+
+      if (e.date >= startDate && e.date <= endDate) {
+        m.monthSpent += amt;
+        m.monthCount += 1;
+      }
+      if (e.date >= prevStartDate && e.date <= prevEndDate) {
+        m.prevMonthSpent += amt;
+        m.prevMonthCount += 1;
+      }
+    });
+
+    const merchants = Object.values(merchantMap)
+      .map((m) => {
+        // Primary category = highest transaction count
+        let primaryCategory = null;
+        let maxCount = 0;
+        Object.entries(m.categoryCounts).forEach(([name, count]) => {
+          if (count > maxCount) {
+            maxCount = count;
+            primaryCategory = { name, icon: m.categoryIcons[name] || '📌' };
+          }
+        });
+
+        // Trend
+        let trend = 'flat';
+        if (m.prevMonthSpent === 0 && m.monthSpent > 0) trend = 'new';
+        else if (m.prevMonthSpent > 0) {
+          const change = ((m.monthSpent - m.prevMonthSpent) / m.prevMonthSpent) * 100;
+          if (change > 10) trend = 'up';
+          else if (change < -10) trend = 'down';
+        }
+
+        return {
+          name: m.name,
+          monthSpent: m.monthSpent,
+          monthCount: m.monthCount,
+          monthAvg: m.monthCount > 0 ? m.monthSpent / m.monthCount : 0,
+          prevMonthSpent: m.prevMonthSpent,
+          allTimeSpent: m.allTimeSpent,
+          allTimeCount: m.allTimeCount,
+          lastDate: m.lastDate,
+          primaryCategory,
+          trend,
+        };
+      })
+      .filter((m) => m.monthCount > 0 || m.prevMonthCount > 0) // only relevant merchants
+      .sort((a, b) => b.monthSpent - a.monthSpent);
+
+    res.json({
+      month: startDate.toISOString().slice(0, 7),
+      merchants,
+    });
+  } catch (error) {
+    console.error('Merchant stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch merchant stats.' });
+  }
+});
+
+// ==========================================
+// 4. INCOME ROUTES
 // ==========================================
 app.get('/api/incomes', authenticateToken, async (req, res) => {
   try {
@@ -302,7 +472,7 @@ app.delete('/api/incomes/:id', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 4. DASHBOARD SUMMARY
+// 5. DASHBOARD SUMMARY
 // ==========================================
 app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
   try {
@@ -364,7 +534,7 @@ app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 5. CATEGORY ROUTES
+// 6. CATEGORY ROUTES
 // ==========================================
 app.get('/api/categories', authenticateToken, async (req, res) => {
   try {
@@ -444,7 +614,7 @@ app.post('/api/seed-savings-categories', authenticateToken, async (req, res) => 
 });
 
 // ==========================================
-// 6. BUDGET ROUTES
+// 7. BUDGET ROUTES
 // ==========================================
 app.get('/api/budgets', authenticateToken, async (req, res) => {
   try {
@@ -506,10 +676,8 @@ app.delete('/api/budgets/:id', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 7. RECURRING RULES ROUTES ⭐ NEW
+// 8. RECURRING RULES
 // ==========================================
-
-// List all recurring rules
 app.get('/api/recurring-rules', authenticateToken, async (req, res) => {
   try {
     const rules = await prisma.recurringRule.findMany({
@@ -524,7 +692,6 @@ app.get('/api/recurring-rules', authenticateToken, async (req, res) => {
   }
 });
 
-// Create a recurring rule
 app.post('/api/recurring-rules', authenticateToken, async (req, res) => {
   try {
     const { description, amount, frequency, dayOfMonth, dayOfWeek, categoryId } = req.body;
@@ -534,9 +701,7 @@ app.post('/api/recurring-rules', authenticateToken, async (req, res) => {
     if (!['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'].includes(frequency)) {
       return res.status(400).json({ error: 'Invalid frequency.' });
     }
-
     const nextExecution = computeNextExecution(frequency, dayOfMonth, dayOfWeek);
-
     const rule = await prisma.recurringRule.create({
       data: {
         description: description.trim(),
@@ -558,23 +723,18 @@ app.post('/api/recurring-rules', authenticateToken, async (req, res) => {
   }
 });
 
-// Update a recurring rule
 app.put('/api/recurring-rules/:id', authenticateToken, async (req, res) => {
   try {
     const { description, amount, frequency, dayOfMonth, dayOfWeek, categoryId, isActive } = req.body;
-
     const existing = await prisma.recurringRule.findFirst({
       where: { id: req.params.id, userId: req.user.id },
     });
     if (!existing) return res.status(404).json({ error: 'Recurring rule not found.' });
 
-    // If frequency/day changed, recompute nextExecution
     const newFrequency = frequency || existing.frequency;
     const newDayOfMonth = dayOfMonth !== undefined ? (dayOfMonth ? parseInt(dayOfMonth) : null) : existing.dayOfMonth;
     const newDayOfWeek = dayOfWeek !== undefined ? (dayOfWeek !== null && dayOfWeek !== '' ? parseInt(dayOfWeek) : null) : existing.dayOfWeek;
-
-    const shouldRecompute =
-      frequency !== undefined || dayOfMonth !== undefined || dayOfWeek !== undefined;
+    const shouldRecompute = frequency !== undefined || dayOfMonth !== undefined || dayOfWeek !== undefined;
 
     const rule = await prisma.recurringRule.update({
       where: { id: req.params.id },
@@ -599,7 +759,6 @@ app.put('/api/recurring-rules/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Toggle active status
 app.patch('/api/recurring-rules/:id/toggle', authenticateToken, async (req, res) => {
   try {
     const existing = await prisma.recurringRule.findFirst({
@@ -619,7 +778,6 @@ app.patch('/api/recurring-rules/:id/toggle', authenticateToken, async (req, res)
   }
 });
 
-// Delete
 app.delete('/api/recurring-rules/:id', authenticateToken, async (req, res) => {
   try {
     await prisma.recurringRule.delete({ where: { id: req.params.id, userId: req.user.id } });
@@ -630,7 +788,7 @@ app.delete('/api/recurring-rules/:id', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 8. RECURRING EXPENSES CRON JOB (now inherits type from category)
+// 9. RECURRING CRON JOB (⭐ UPDATED: merchant = description)
 // ==========================================
 const processRecurringExpenses = async () => {
   console.log('🔄 Running recurring job...');
@@ -644,7 +802,6 @@ const processRecurringExpenses = async () => {
 
   for (const rule of rules) {
     try {
-      // ⭐ Inherit type from the linked category
       const entryType = rule.category?.type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE';
 
       await prisma.expense.create({
@@ -652,6 +809,7 @@ const processRecurringExpenses = async () => {
           amount: rule.amount,
           date: today,
           note: `${rule.description} (Auto - Recurring)`,
+          merchant: normaliseMerchant(rule.description), // ⭐
           isRecurring: true,
           type: entryType,
           userId: rule.userId,
@@ -659,7 +817,6 @@ const processRecurringExpenses = async () => {
         },
       });
 
-      // Advance nextExecution
       let nextExec = new Date(today);
       if (rule.frequency === 'DAILY') nextExec.setDate(today.getDate() + 1);
       else if (rule.frequency === 'WEEKLY') nextExec.setDate(today.getDate() + 7);
@@ -689,7 +846,7 @@ cron.schedule('30 18 * * *', processRecurringExpenses);
 setTimeout(processRecurringExpenses, 10000);
 
 // ==========================================
-// 9. GMAIL INTEGRATION
+// 10. GMAIL INTEGRATION (⭐ UPDATED: save merchant)
 // ==========================================
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -812,10 +969,23 @@ const processGmailReceipts = async (userId) => {
       });
       if (existing) continue;
 
+      // ⭐ Detect merchant name from sender
+      let merchantName = 'Unknown';
+      if (sender.includes('amazonpay')) merchantName = 'Amazon Pay';
+      else if (sender.includes('amazon')) merchantName = 'Amazon';
+      else if (sender.includes('swiggy')) merchantName = 'Swiggy';
+      else if (sender.includes('zomato')) merchantName = 'Zomato';
+      else if (sender.includes('uber')) merchantName = 'Uber';
+      else if (sender.includes('flipkart')) merchantName = 'Flipkart';
+      else if (sender.includes('icici')) merchantName = 'ICICI Bank';
+      else if (sender.includes('yesbank')) merchantName = 'YES Bank';
+
       await prisma.expense.create({
         data: {
           amount, date: new Date(parseInt(msgData.data.internalDate)),
-          note: `Auto-import: ${subject}`, isRecurring: false,
+          note: `Auto-import: ${subject}`,
+          merchant: merchantName, // ⭐
+          isRecurring: false,
           type: 'EXPENSE', userId, categoryId: defaultCategory.id,
         },
       });
@@ -871,7 +1041,7 @@ app.post('/api/gmail/sync', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 10. PENDING IMPORTS
+// 11. PENDING IMPORTS (⭐ UPDATED: carry merchant through)
 // ==========================================
 app.get('/api/pending', authenticateToken, async (req, res) => {
   try {
@@ -890,7 +1060,13 @@ app.put('/api/pending/:id', authenticateToken, async (req, res) => {
   try {
     const pending = await prisma.pendingImport.update({
       where: { id: req.params.id, userId: req.user.id },
-      data: { amount: parseFloat(amount), merchant, date: new Date(date), note, categoryId: categoryId || null },
+      data: {
+        amount: parseFloat(amount),
+        merchant,
+        date: new Date(date),
+        note,
+        categoryId: categoryId || null,
+      },
       include: { category: true },
     });
     res.json(pending);
@@ -923,10 +1099,14 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
     }
     const expense = await prisma.expense.create({
       data: {
-        amount: pending.amount, date: pending.date,
+        amount: pending.amount,
+        date: pending.date,
         note: pending.note || pending.merchant,
-        categoryId: finalCategoryId, userId: req.user.id,
-        isRecurring: false, type: 'EXPENSE',
+        merchant: pending.merchant, // ⭐
+        categoryId: finalCategoryId,
+        userId: req.user.id,
+        isRecurring: false,
+        type: 'EXPENSE',
       },
     });
     await prisma.pendingImport.update({ where: { id: pending.id }, data: { status: 'confirmed' } });
@@ -938,7 +1118,7 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 11. KEEP-ALIVE + START
+// 12. KEEP-ALIVE + START
 // ==========================================
 app.get('/ping', (req, res) => res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() }));
 
