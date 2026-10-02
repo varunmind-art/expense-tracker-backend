@@ -121,6 +121,7 @@ model Income {
 model Merchant {
   id        String   @id @default(cuid())
   name      String
+  aliases   String[] @default([])   // ⭐ NEW
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   isActive  Boolean  @default(true)

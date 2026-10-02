@@ -88,10 +88,32 @@ const normaliseMerchant = (m) => {
   return trimmed.slice(0, 100);
 };
 
-// ⭐ Auto-register merchant into the managed list
+// ⭐ Resolve merchant name to canonical (looks up aliases)
+const resolveMerchantAlias = async (userId, inputName) => {
+  const name = normaliseMerchant(inputName);
+  if (!name) return null;
+
+  const match = await prisma.merchant.findFirst({
+    where: {
+      userId,
+      OR: [
+        { name },
+        { aliases: { has: name } },
+      ],
+    },
+  });
+  return match ? match.name : name;
+};
+
+// ⭐ Auto-register merchant into the managed list (idempotent)
 const upsertManagedMerchant = async (userId, merchantName) => {
   const name = normaliseMerchant(merchantName);
   if (!name) return;
+
+  // If an alias exists pointing to an existing merchant, don't create a new one
+  const resolved = await resolveMerchantAlias(userId, name);
+  if (resolved !== name) return; // already known via alias
+
   try {
     await prisma.merchant.upsert({
       where: { userId_name: { userId, name } },
@@ -202,7 +224,9 @@ app.get('/api/expenses', authenticateToken, async (req, res) => {
 app.post('/api/expenses', authenticateToken, async (req, res) => {
   try {
     const { amount, date, note, merchant, categoryId, receiptUrl, isRecurring, type } = req.body;
-    const normMerchant = normaliseMerchant(merchant);
+    const rawMerchant = normaliseMerchant(merchant);
+    const normMerchant = rawMerchant ? await resolveMerchantAlias(req.user.id, rawMerchant) : null;
+
     const expense = await prisma.expense.create({
       data: {
         amount: parseFloat(amount),
@@ -225,7 +249,11 @@ app.post('/api/expenses', authenticateToken, async (req, res) => {
 app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
   try {
     const { amount, date, note, merchant, categoryId, receiptUrl, type } = req.body;
-    const normMerchant = merchant !== undefined ? normaliseMerchant(merchant) : undefined;
+    const rawMerchant = merchant !== undefined ? normaliseMerchant(merchant) : undefined;
+    const normMerchant = rawMerchant
+      ? await resolveMerchantAlias(req.user.id, rawMerchant)
+      : rawMerchant;
+
     const expense = await prisma.expense.update({
       where: { id: req.params.id, userId: req.user.id },
       data: {
@@ -297,6 +325,7 @@ app.get('/api/merchants', authenticateToken, async (req, res) => {
   }
 });
 
+// ⭐ Merchant stats with alias resolution
 app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
   try {
     const { month } = req.query;
@@ -323,10 +352,23 @@ app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
       orderBy: { date: 'desc' },
     });
 
+    // ⭐ Build alias → canonical map
+    const allMerchantRecords = await prisma.merchant.findMany({
+      where: { userId: req.user.id },
+      select: { name: true, aliases: true },
+    });
+    const aliasMap = {};
+    allMerchantRecords.forEach((m) => {
+      aliasMap[m.name] = m.name;
+      m.aliases.forEach((a) => { aliasMap[a] = m.name; });
+    });
+
     const merchantMap = {};
     allRecent.forEach((e) => {
-      const name = (e.merchant || '').trim();
-      if (!name) return;
+      const rawName = (e.merchant || '').trim();
+      if (!rawName) return;
+      const name = aliasMap[rawName] || rawName;
+
       if (!merchantMap[name]) {
         merchantMap[name] = {
           name, monthSpent: 0, monthCount: 0, prevMonthSpent: 0, prevMonthCount: 0,
@@ -374,6 +416,38 @@ app.get('/api/merchants/stats', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Merchant stats error:', error);
     res.status(500).json({ error: 'Failed to fetch merchant stats.' });
+  }
+});
+
+// ⭐ Get recent transactions for a merchant (for the drawer)
+app.get('/api/merchants/transactions', authenticateToken, async (req, res) => {
+  try {
+    const { name, limit } = req.query;
+    if (!name) return res.status(400).json({ error: 'Merchant name is required.' });
+
+    const take = Math.min(parseInt(limit) || 10, 50);
+
+    // Find the merchant record to get its aliases
+    const merchant = await prisma.merchant.findFirst({
+      where: { userId: req.user.id, name },
+    });
+    const aliases = merchant?.aliases || [];
+    const namesToMatch = [name, ...aliases];
+
+    const transactions = await prisma.expense.findMany({
+      where: {
+        userId: req.user.id,
+        merchant: { in: namesToMatch },
+      },
+      include: { category: true },
+      orderBy: { date: 'desc' },
+      take,
+    });
+
+    res.json({ merchant: name, aliases, transactions });
+  } catch (error) {
+    console.error('Merchant transactions error:', error);
+    res.status(500).json({ error: 'Failed to fetch transactions.' });
   }
 });
 
@@ -478,6 +552,69 @@ app.post('/api/merchant-list/import-existing', authenticateToken, async (req, re
   } catch (error) {
     console.error('Import merchants error:', error);
     res.status(500).json({ error: 'Failed to import merchants.', details: error.message });
+  }
+});
+
+// ⭐ Add an alias to a merchant
+app.post('/api/merchant-list/:id/aliases', authenticateToken, async (req, res) => {
+  try {
+    const { alias } = req.body;
+    if (!alias || !alias.trim()) return res.status(400).json({ error: 'Alias is required.' });
+    const cleanAlias = alias.trim().slice(0, 100);
+
+    const merchant = await prisma.merchant.findFirst({
+      where: { id: req.params.id, userId: req.user.id },
+    });
+    if (!merchant) return res.status(404).json({ error: 'Merchant not found.' });
+
+    // Check if alias already exists on another merchant
+    const conflict = await prisma.merchant.findFirst({
+      where: {
+        userId: req.user.id,
+        NOT: { id: merchant.id },
+        OR: [
+          { name: cleanAlias },
+          { aliases: { has: cleanAlias } },
+        ],
+      },
+    });
+    if (conflict) {
+      return res.status(409).json({ error: `"${cleanAlias}" already belongs to ${conflict.name}.` });
+    }
+
+    // Already an alias on this merchant?
+    if (merchant.aliases.includes(cleanAlias)) {
+      return res.json(merchant);
+    }
+
+    const updated = await prisma.merchant.update({
+      where: { id: merchant.id },
+      data: { aliases: { push: cleanAlias } },
+    });
+    res.json(updated);
+  } catch (error) {
+    console.error('Add alias error:', error);
+    res.status(500).json({ error: 'Failed to add alias.' });
+  }
+});
+
+// ⭐ Remove an alias from a merchant
+app.delete('/api/merchant-list/:id/aliases/:alias', authenticateToken, async (req, res) => {
+  try {
+    const alias = decodeURIComponent(req.params.alias);
+    const merchant = await prisma.merchant.findFirst({
+      where: { id: req.params.id, userId: req.user.id },
+    });
+    if (!merchant) return res.status(404).json({ error: 'Merchant not found.' });
+
+    const updated = await prisma.merchant.update({
+      where: { id: merchant.id },
+      data: { aliases: merchant.aliases.filter((a) => a !== alias) },
+    });
+    res.json(updated);
+  } catch (error) {
+    console.error('Remove alias error:', error);
+    res.status(500).json({ error: 'Failed to remove alias.' });
   }
 });
 
@@ -830,7 +967,10 @@ const processRecurringExpenses = async () => {
   for (const rule of rules) {
     try {
       const entryType = rule.category?.type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE';
-      const normMerchant = normaliseMerchant(rule.description);
+      const rawMerchant = normaliseMerchant(rule.description);
+      const normMerchant = rawMerchant
+        ? await resolveMerchantAlias(rule.userId, rawMerchant)
+        : rawMerchant;
 
       await prisma.expense.create({
         data: {
@@ -990,16 +1130,19 @@ const processGmailReceipts = async (userId) => {
       else if (sender.includes('icici')) merchantName = 'ICICI Bank';
       else if (sender.includes('yesbank')) merchantName = 'YES Bank';
 
+      // ⭐ Resolve via aliases
+      const resolvedMerchant = await resolveMerchantAlias(userId, merchantName);
+
       await prisma.expense.create({
         data: {
           amount, date: new Date(parseInt(msgData.data.internalDate)),
           note: `Auto-import: ${subject}`,
-          merchant: merchantName,
+          merchant: resolvedMerchant,
           isRecurring: false, type: 'EXPENSE',
           userId, categoryId: defaultCategory.id,
         },
       });
-      await upsertManagedMerchant(userId, merchantName);
+      await upsertManagedMerchant(userId, resolvedMerchant);
       importedCount++;
     } catch (error) {
       console.error(`❌ Error processing email ${msg.id}:`, error.message);
@@ -1105,16 +1248,22 @@ app.post('/api/pending/:id/confirm', authenticateToken, async (req, res) => {
       const fallback = await getUserDefaultCategory(req.user.id);
       finalCategoryId = fallback.id;
     }
+
+    // ⭐ Resolve merchant via aliases
+    const resolvedMerchant = pending.merchant
+      ? await resolveMerchantAlias(req.user.id, pending.merchant)
+      : null;
+
     const expense = await prisma.expense.create({
       data: {
         amount: pending.amount, date: pending.date,
         note: pending.note || pending.merchant,
-        merchant: pending.merchant,
+        merchant: resolvedMerchant,
         categoryId: finalCategoryId, userId: req.user.id,
         isRecurring: false, type: 'EXPENSE',
       },
     });
-    if (pending.merchant) await upsertManagedMerchant(req.user.id, pending.merchant);
+    if (resolvedMerchant) await upsertManagedMerchant(req.user.id, resolvedMerchant);
     await prisma.pendingImport.update({ where: { id: pending.id }, data: { status: 'confirmed' } });
     res.json({ message: 'Expense created from pending import.', expense });
   } catch (error) {
