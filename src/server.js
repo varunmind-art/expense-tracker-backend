@@ -92,6 +92,21 @@ const normaliseMerchant = (m) => {
   // Cap length to prevent abuse
   return trimmed.slice(0, 100);
 };
+// ⭐ Auto-register merchant into the managed list (idempotent)
+const upsertManagedMerchant = async (userId, merchantName) => {
+  const name = normaliseMerchant(merchantName);
+  if (!name) return;
+  try {
+    await prisma.merchant.upsert({
+      where: { userId_name: { userId, name } },
+      update: {}, // no-op if exists
+      create: { userId, name, isActive: true },
+    });
+  } catch (err) {
+    // Non-fatal – never break expense creation
+    console.error('upsertManagedMerchant error:', err.message);
+  }
+};
 
 // ==========================================
 // 1. AUTH ROUTES
@@ -194,12 +209,14 @@ app.get('/api/expenses', authenticateToken, async (req, res) => {
 app.post('/api/expenses', authenticateToken, async (req, res) => {
   try {
     const { amount, date, note, merchant, categoryId, receiptUrl, isRecurring, type } = req.body;
+    const normMerchant = normaliseMerchant(merchant);
+
     const expense = await prisma.expense.create({
       data: {
         amount: parseFloat(amount),
         date: date ? new Date(date) : new Date(),
         note,
-        merchant: normaliseMerchant(merchant), // ⭐
+        merchant: normMerchant,
         receiptUrl,
         isRecurring: isRecurring || false,
         type: type === 'SAVINGS' ? 'SAVINGS' : 'EXPENSE',
@@ -208,6 +225,10 @@ app.post('/api/expenses', authenticateToken, async (req, res) => {
       },
       include: { category: true },
     });
+
+    // ⭐ Auto-add merchant to the managed list
+    if (normMerchant) await upsertManagedMerchant(req.user.id, normMerchant);
+
     res.status(201).json(expense);
   } catch (error) {
     console.error(error);
@@ -218,19 +239,25 @@ app.post('/api/expenses', authenticateToken, async (req, res) => {
 app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
   try {
     const { amount, date, note, merchant, categoryId, receiptUrl, type } = req.body;
+    const normMerchant = merchant !== undefined ? normaliseMerchant(merchant) : undefined;
+
     const expense = await prisma.expense.update({
       where: { id: req.params.id, userId: req.user.id },
       data: {
         amount: parseFloat(amount),
         date: new Date(date),
         note,
-        ...(merchant !== undefined && { merchant: normaliseMerchant(merchant) }), // ⭐
+        ...(merchant !== undefined && { merchant: normMerchant }),
         categoryId,
         receiptUrl,
         ...(type && { type }),
       },
       include: { category: true },
     });
+
+    // ⭐ Auto-add merchant to the managed list
+    if (normMerchant) await upsertManagedMerchant(req.user.id, normMerchant);
+
     res.json(expense);
   } catch (error) {
     res.status(500).json({ error: 'Failed to update expense.' });
@@ -280,6 +307,120 @@ app.get('/api/merchants', authenticateToken, async (req, res) => {
       select: { merchant: true, date: true },
       orderBy: { date: 'desc' },
     });
+
+    // ==========================================
+// ⭐ NEW: Managed Merchant list CRUD
+// ==========================================
+
+// List all managed merchants
+app.get('/api/merchant-list', authenticateToken, async (req, res) => {
+  try {
+    const merchants = await prisma.merchant.findMany({
+      where: { userId: req.user.id },
+      orderBy: [{ isActive: 'desc' }, { name: 'asc' }],
+    });
+    res.json(merchants);
+  } catch (error) {
+    console.error('List merchant error:', error);
+    res.status(500).json({ error: 'Failed to fetch merchant list.' });
+  }
+});
+
+// Add a merchant to the managed list
+app.post('/api/merchant-list', authenticateToken, async (req, res) => {
+  try {
+    const { name, isActive } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Merchant name is required.' });
+    const merchant = await prisma.merchant.create({
+      data: {
+        name: name.trim().slice(0, 100),
+        isActive: isActive !== false,
+        userId: req.user.id,
+      },
+    });
+    res.status(201).json(merchant);
+  } catch (error) {
+    if (error.code === 'P2002') return res.status(409).json({ error: 'This merchant already exists.' });
+    console.error('Create merchant error:', error);
+    res.status(500).json({ error: 'Failed to create merchant.' });
+  }
+});
+
+// Update a merchant (rename or toggle active)
+app.put('/api/merchant-list/:id', authenticateToken, async (req, res) => {
+  try {
+    const { name, isActive } = req.body;
+    const existing = await prisma.merchant.findFirst({
+      where: { id: req.params.id, userId: req.user.id },
+    });
+    if (!existing) return res.status(404).json({ error: 'Merchant not found.' });
+
+    const updated = await prisma.merchant.update({
+      where: { id: req.params.id },
+      data: {
+        ...(name !== undefined && name.trim() && { name: name.trim().slice(0, 100) }),
+        ...(isActive !== undefined && { isActive }),
+      },
+    });
+    res.json(updated);
+  } catch (error) {
+    if (error.code === 'P2002') return res.status(409).json({ error: 'A merchant with this name already exists.' });
+    console.error('Update merchant error:', error);
+    res.status(500).json({ error: 'Failed to update merchant.' });
+  }
+});
+
+// Delete a merchant from the managed list
+app.delete('/api/merchant-list/:id', authenticateToken, async (req, res) => {
+  try {
+    await prisma.merchant.delete({ where: { id: req.params.id, userId: req.user.id } });
+    res.json({ message: 'Merchant removed.' });
+  } catch (error) {
+    console.error('Delete merchant error:', error);
+    res.status(500).json({ error: 'Failed to delete merchant.' });
+  }
+});
+
+// One-time: import all merchants already used in expenses
+app.post('/api/merchant-list/import-existing', authenticateToken, async (req, res) => {
+  try {
+    const rows = await prisma.expense.findMany({
+      where: { userId: req.user.id, merchant: { not: null } },
+      select: { merchant: true },
+      distinct: ['merchant'],
+    });
+
+    const existing = await prisma.merchant.findMany({
+      where: { userId: req.user.id },
+      select: { name: true },
+    });
+    const existingSet = new Set(existing.map((m) => m.name));
+
+    let added = 0;
+    let skipped = 0;
+    for (const r of rows) {
+      const name = (r.merchant || '').trim();
+      if (!name) continue;
+      if (existingSet.has(name)) {
+        skipped++;
+        continue;
+      }
+      try {
+        await prisma.merchant.create({
+          data: { userId: req.user.id, name, isActive: true },
+        });
+        existingSet.add(name);
+        added++;
+      } catch (err) {
+        // Ignore P2002 (already added in loop) and other non-fatal errors
+      }
+    }
+    res.json({ message: 'Import complete', added, skipped });
+  } catch (error) {
+    console.error('Import merchants error:', error);
+    res.status(500).json({ error: 'Failed to import merchants.' });
+  }
+});
 
     const map = {};
     rows.forEach((r) => {
