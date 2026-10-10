@@ -14,11 +14,19 @@ const {
   isSessionPayload,
   isResetPayload,
   isSessionVersionCurrent,
+  decideSession,
+  SESSION_DECISION,
   passwordFingerprint,
   fingerprintsMatch,
   validateNewPassword,
   buildResetConsumeArgs,
 } = require('./lib/auth-tokens');
+const {
+  isSupportedFrequency,
+  computeNextExecution,
+  listDuePeriods,
+  periodKey,
+} = require('./lib/schedule');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -80,7 +88,8 @@ const authenticateToken = async (req, res, next) => {
     });
   } catch (error) {
     // A database failure is NOT an authentication failure: returning 401 here
-    // would log every user out during an outage.
+    // would log every user out during an outage. Fail closed WITHOUT letting the
+    // request through, but report it as unavailable.
     console.error(
       'Token-version lookup failed:',
       error
@@ -90,14 +99,14 @@ const authenticateToken = async (req, res, next) => {
     });
   }
 
-  // Covers a deleted user (account === null) as well as a revoked session.
-  if (
-    !account ||
-    !isSessionVersionCurrent(
-      payload,
-      account.tokenVersion
-    )
-  ) {
+  // Covers a deleted account, a disabled account (if that column is ever added)
+  // and a revoked session, all in one tested decision function.
+  const decision = decideSession(
+    payload,
+    account
+  );
+
+  if (decision !== SESSION_DECISION.OK) {
     return res.status(401).json({
       error: 'Invalid or expired token.',
     });
@@ -223,48 +232,6 @@ const getUserDefaultCategory = async (userId) => {
   }
 
   return category;
-};
-
-const computeNextExecution = (
-  frequency,
-  dayOfMonth,
-  dayOfWeek
-) => {
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
-
-  const next = new Date(now);
-
-  if (frequency === 'DAILY') {
-    next.setDate(now.getDate() + 1);
-  } else if (frequency === 'WEEKLY') {
-    const target =
-      dayOfWeek !== null && dayOfWeek !== undefined
-        ? parseInt(dayOfWeek)
-        : now.getDay();
-
-    const diff =
-      (target - now.getDay() + 7) % 7;
-
-    next.setDate(
-      now.getDate() + (diff === 0 ? 7 : diff)
-    );
-  } else if (frequency === 'MONTHLY') {
-    const targetDate = dayOfMonth
-      ? parseInt(dayOfMonth)
-      : now.getDate();
-
-    next.setMonth(now.getMonth() + 1);
-    next.setDate(targetDate);
-
-    if (next.getDate() !== targetDate) {
-      next.setDate(0);
-    }
-  } else if (frequency === 'YEARLY') {
-    next.setFullYear(now.getFullYear() + 1);
-  }
-
-  return next;
 };
 
 const normaliseMerchant = (merchant) => {
@@ -3541,17 +3508,10 @@ app.post(
         });
       }
 
-      if (
-        ![
-          'DAILY',
-          'WEEKLY',
-          'MONTHLY',
-          'YEARLY',
-        ].includes(frequency)
-      ) {
+      // P0-4: one shared allowlist, used identically on create and update.
+      if (!isSupportedFrequency(frequency)) {
         return res.status(400).json({
-          error:
-            'Invalid frequency.',
+          error: 'Invalid frequency.',
         });
       }
 
@@ -3652,6 +3612,16 @@ app.put(
       const newFrequency =
         frequency ||
         existing.frequency;
+
+      // P0-4: PUT previously accepted ANY frequency string, which is how an
+      // unsupported value reached the scheduler and duplicated the expense on
+      // every run. Validating the resolved value also means a rule can never be
+      // saved with an unusable schedule.
+      if (!isSupportedFrequency(newFrequency)) {
+        return res.status(400).json({
+          error: 'Invalid frequency.',
+        });
+      }
 
       const newDayOfMonth =
         dayOfMonth !== undefined
@@ -3863,6 +3833,33 @@ const processRecurringExpenses =
             ? 'SAVINGS'
             : 'EXPENSE';
 
+        // P0-5: advance from the rule's OWN nextExecution rather than from
+        // "today", and materialise every period that has come due (bounded by
+        // the documented catch-up cap) instead of silently dropping them.
+        const due = listDuePeriods(
+          rule.frequency,
+          rule.dayOfMonth,
+          rule.dayOfWeek,
+          rule.nextExecution,
+          today
+        );
+
+        // P0-4: an unusable schedule is skipped and reported. Previously an
+        // unsupported frequency fell through the scheduler, which left
+        // nextExecution at today and re-fired the rule on every run, creating a
+        // duplicate expense indefinitely.
+        if (due.invalid) {
+          console.error(
+            `Skipping recurring rule ${rule.id}: unusable schedule ` +
+              `(frequency="${rule.frequency}")`
+          );
+          continue;
+        }
+
+        if (due.periods.length === 0) {
+          continue;
+        }
+
         const rawMerchant =
           normaliseMerchant(
             rule.description
@@ -3876,32 +3873,85 @@ const processRecurringExpenses =
               )
             : rawMerchant;
 
-        await prisma.expense.create({
-          data: {
-            amount:
-              rule.amount,
+        for (const period of due.periods) {
+          const nextExec =
+            computeNextExecution(
+              rule.frequency,
+              rule.dayOfMonth,
+              rule.dayOfWeek,
+              period
+            );
 
-            date: today,
+          if (!nextExec) {
+            console.error(
+              `Skipping recurring rule ${rule.id}: cannot advance past ` +
+                `${periodKey(period)}`
+            );
+            break;
+          }
 
-            note:
-              `${rule.description} ` +
-              '(Auto - Recurring)',
+          // Idempotency across retries AND concurrent executions.
+          //
+          // updateMany() puts the stored nextExecution in the WHERE clause, so
+          // the claim only matches while it still equals the value this worker
+          // read. Of two concurrent runs, exactly one claims each period and the
+          // other receives count === 0 and skips it.
+          //
+          // The claim and the expense are written in ONE transaction, so a
+          // failure to insert rolls the claim back rather than losing the
+          // period. That makes this at-most-once (no duplicates) WITHOUT being
+          // at-most-once-and-lossy.
+          const created = await prisma.$transaction(
+            async (tx) => {
+              const claim =
+                await tx.recurringRule.updateMany({
+                  where: {
+                    id: rule.id,
+                    nextExecution: period,
+                    isActive: true,
+                  },
+                  data: {
+                    nextExecution: nextExec,
+                  },
+                });
 
-            merchant:
-              normMerchant,
+              if (claim.count === 0) {
+                return null;
+              }
 
-            isRecurring: true,
+              return tx.expense.create({
+                data: {
+                  amount: rule.amount,
 
-            type:
-              entryType,
+                  // Dated at the period it was DUE, not at the run date, so a
+                  // catch-up entry lands in the correct month.
+                  date: period,
 
-            userId:
-              rule.userId,
+                  note:
+                    `${rule.description} ` +
+                    '(Auto - Recurring)',
 
-            categoryId:
-              rule.categoryId,
-          },
-        });
+                  merchant: normMerchant,
+
+                  isRecurring: true,
+
+                  type: entryType,
+
+                  userId: rule.userId,
+
+                  categoryId: rule.categoryId,
+                },
+              });
+            }
+          );
+
+          if (created) {
+            console.log(
+              `✅ Auto-created ${entryType} ` +
+                `for "${rule.description}" (${periodKey(period)})`
+            );
+          }
+        }
 
         if (normMerchant) {
           await upsertManagedMerchant(
@@ -3910,69 +3960,12 @@ const processRecurringExpenses =
           );
         }
 
-        let nextExec =
-          new Date(today);
-
-        if (
-          rule.frequency ===
-          'DAILY'
-        ) {
-          nextExec.setDate(
-            today.getDate() + 1
-          );
-        } else if (
-          rule.frequency ===
-          'WEEKLY'
-        ) {
-          nextExec.setDate(
-            today.getDate() + 7
-          );
-        } else if (
-          rule.frequency ===
-          'MONTHLY'
-        ) {
-          nextExec.setMonth(
-            today.getMonth() + 1
-          );
-
-          if (
-            rule.dayOfMonth
-          ) {
-            nextExec.setDate(
-              rule.dayOfMonth
-            );
-
-            if (
-              nextExec.getDate() !==
-              rule.dayOfMonth
-            ) {
-              nextExec.setDate(0);
-            }
-          }
-        } else if (
-          rule.frequency ===
-          'YEARLY'
-        ) {
-          nextExec.setFullYear(
-            today.getFullYear() +
-              1
+        if (due.hasMore) {
+          console.warn(
+            `⚠️ Recurring rule ${rule.id} is further behind than the ` +
+              `catch-up cap; the remaining periods will be created on the next run.`
           );
         }
-
-        await prisma.recurringRule.update({
-          where: {
-            id: rule.id,
-          },
-          data: {
-            nextExecution:
-              nextExec,
-          },
-        });
-
-        console.log(
-          `✅ Auto-created ${entryType} ` +
-          `for "${rule.description}"`
-        );
       } catch (error) {
         console.error(
           `❌ Failed to process recurring rule ${rule.id}:`,
@@ -4928,6 +4921,6 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    'Recurring job scheduled for 00:05 IST daily.'
+    'Recurring job scheduled daily at 18:30 UTC (00:00 IST).'
   );
 });

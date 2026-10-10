@@ -252,6 +252,55 @@ const buildResetConsumeArgs = (userId, currentPasswordDigest, newPasswordHash) =
   },
 });
 
+/**
+ * Outcome of evaluating a request's session, kept separate from HTTP so every
+ * branch is unit testable without a database or an Express app.
+ */
+const SESSION_DECISION = Object.freeze({
+  /** Authenticated: proceed. */
+  OK: 'ok',
+  /** No valid credential: reject with 401. */
+  UNAUTHENTICATED: 'unauthenticated',
+  /** The check could not be performed: fail closed, but NOT as a 401, so an
+   *  outage does not log every user out. */
+  UNAVAILABLE: 'unavailable',
+});
+
+/**
+ * Decide whether a token payload authenticates against the loaded account row.
+ *
+ * Fails closed at every step: an unrecognised purpose, a missing account
+ * (deleted user), a disabled/deactivated account, or any version mismatch all
+ * resolve to UNAUTHENTICATED rather than OK.
+ *
+ * NOTE ON "DISABLED": the User model currently has **no** disabled/deactivated
+ * column, so a disabled user is not representable today. The `disabled` /
+ * `isActive` checks below are deliberate forward-compatibility: if that column
+ * is ever added, revocation takes effect here without further changes, and the
+ * tests already pin the expected behaviour. Adding the column needs schema
+ * approval, which has not been sought.
+ */
+const decideSession = (payload, account) => {
+  if (!isSessionPayload(payload)) {
+    return SESSION_DECISION.UNAUTHENTICATED;
+  }
+
+  // A deleted user: the row is gone, so nothing can vouch for the token.
+  if (!account) {
+    return SESSION_DECISION.UNAUTHENTICATED;
+  }
+
+  if (account.disabled === true || account.isActive === false) {
+    return SESSION_DECISION.UNAUTHENTICATED;
+  }
+
+  if (!isSessionVersionCurrent(payload, account.tokenVersion)) {
+    return SESSION_DECISION.UNAUTHENTICATED;
+  }
+
+  return SESSION_DECISION.OK;
+};
+
 module.exports = {
   PURPOSE,
   SESSION_TTL,
@@ -259,9 +308,11 @@ module.exports = {
   MIN_PASSWORD_LENGTH,
   MAX_PASSWORD_BYTES,
   DEFAULT_TOKEN_VERSION,
+  SESSION_DECISION,
   normaliseTokenVersion,
   tokenVersionOf,
   isSessionVersionCurrent,
+  decideSession,
   passwordFingerprint,
   fingerprintsMatch,
   signSessionToken,
