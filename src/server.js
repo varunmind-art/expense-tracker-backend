@@ -27,6 +27,12 @@ const {
   listDuePeriods,
   periodKey,
 } = require('./lib/schedule');
+const {
+  monthRange,
+  monthRangeForInstant,
+  appLocalDateString,
+} = require('./lib/dateRange');
+const { buildExpenseCsv } = require('./lib/csv');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -962,31 +968,19 @@ app.get(
           },
         });
 
-      let csv =
-        'Date,Type,Category,Merchant,Amount,Note,Receipt\n';
-
-      expenses.forEach((expense) => {
-        const merchant =
-          (expense.merchant || '').replace(
-            /,/g,
-            ';'
-          );
-
-        const note =
-          (expense.note || '').replace(
-            /,/g,
-            ';'
-          );
-
-        csv +=
-          `${expense.date.toISOString().split('T')[0]},` +
-          `${expense.type || 'EXPENSE'},` +
-          `${expense.category.name},` +
-          `${merchant},` +
-          `${expense.amount},` +
-          `${note},` +
-          `${expense.receiptUrl || ''}\n`;
-      });
+      // P0-6: RFC 4180 quoting, a formula-injection guard, and
+      // application-local calendar dates so auto-created rows are no longer
+      // exported one day early. Commas are preserved rather than rewritten into
+      // semicolons, and a category name containing a comma can no longer inject
+      // an extra column.
+      const csv =
+        buildExpenseCsv(
+          expenses,
+          (expense) =>
+            appLocalDateString(
+              expense.date
+            )
+        );
 
       res.header(
         'Content-Type',

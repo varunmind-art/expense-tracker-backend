@@ -36,6 +36,18 @@ The backend has **exactly one** environment file (`.env`) and **exactly one** `D
 
 The approved design compared the token's `iat` against a new `passwordChangedAt` timestamp. **This was superseded by a per-user `tokenVersion` counter**, at your invitation to propose a stronger alternative. Verification showed a concrete defect in the timestamp design: `iat` has **second** precision while a DB timestamp has **millisecond** precision, so a session issued in the same second as a password change can compare as older and be **wrongly rejected**. Truncating the stored timestamp fixes that but opens a **one-second grace window** in which a stolen pre-change token still works. The counter removes the clock from the decision entirely (integer equality: no skew, no tolerance, no instance-clock dependence) and both designs need the same single user read per request. The hazard and the grace window are both demonstrated by test in `test/p0/session-revocation.test.js`. The migration is unapplied, so reverting to the timestamp design is a small, isolated change.
 
+### Elevated to P0 by review decision
+
+| ID | Defect | Evidence | Status |
+|----|--------|----------|--------|
+| **P0-8** | **No category ownership validation.** `categoryId` is taken from the request body and written with only a foreign-key check, never verifying it belongs to the caller, in **seven** write paths: expenses POST/PUT, budgets POST/PUT, recurring-rules POST/PUT, pending PUT/confirm. Five of them return the referenced category via `include: { category: true }`, so an attacker can read another user's category name, icon and colour. `accountId` **is** correctly checked (`getOwnedAccount`), which is what makes the omission an inconsistency rather than a design choice. | see §V-4 below | **OPEN — elevated to P0.** Implementation, the full ownership audit (accounts, budgets, merchants, recurring rules) and the cross-tenant regression suite are **not yet done**; they need the DB-backed test environment for the positive cases |
+
+### P0-6 status after the latest milestone
+
+**PARTIAL.** Delivered and verified: `src/lib/dateRange.js` (strict month/date validation, half-open windows, timezone-stable labels) and `src/lib/csv.js` (RFC 4180 quoting, formula-injection guard, application-local dates), with 21 tests including wiring guards. The **CSV export endpoint is wired** to the safe builder.
+
+**Still unresolved:** the three backend month endpoints (`/api/dashboard/summary`, `/api/merchants/stats`, `/api/incomes`) still use their own duplicated, unvalidated month parsing and the millisecond-excluding end boundary; and the frontend still mixes three time windows on one screen (F-H1) and ignores `b.period` in budget progress (F-H2). No frontend date-window work has been done.
+
 ### Added to P0 by review decision — authentication findings
 
 | ID | Defect | Evidence | Status |
