@@ -18,8 +18,8 @@ Last updated: P0-2 Phase A.
 | **P0-1** | Deleting a category cascades to `Expense`/`Budget`/`RecurringRule` and destroys financial records. User Guide promises the opposite. | `prisma/schema.prisma:60,76,93`; `src/server.js` DELETE `/api/categories/:id`; `docs/USER_GUIDE.md:630` | **OPEN** — revised to category **archiving**; migration prepared only, not applied |
 | **P0-2** | Reset-token privilege escalation: reset links were valid Bearer tokens; session tokens could be replayed as reset tokens; no password validation | `src/server.js` `authenticateToken`, `/api/auth/forgot-password`, `/api/auth/reset-password` | **Phase A FIXED** (`8991d64`). **Phase B prepared** (`f536c27`) — `tokenVersion` counter; migration included but **NOT applied**. Supersedes the approved timestamp design (rationale below) |
 | **P0-3** | Password-reset flow was broken end to end: the backend emails `${FRONTEND_URL}/reset-password?token=…` and no such route or component existed, so a forgotten password meant permanent lockout | was: `FE: src/App.jsx` had no `/reset-password` route (`grep -rn reset-password src/` → 0 hits) | **FIXED** (`957ba5f`) — route + component + 33 tests + passing build. Residual gap: no browser execution yet (needs Playwright) |
-| **P0-4** | `PUT /api/recurring-rules/:id` does not allowlist `frequency`; an unknown value makes the scheduler return the clock unchanged, so the rule refires and duplicates an expense on **every** run, permanently | `src/server.js` PUT handler; `computeNextExecution` fall-through; cron predicate `nextExecution <= today` | **OPEN** — approved (tests already pin it in `test/baseline/scheduling.test.js`) |
-| **P0-5** | MONTHLY scheduling skips an entire month when the run day exceeds the target month's length. Proved blast radius: **31/31** day-of-month values mis-schedule from Jan 31. Also: the cron duplicates `computeNextExecution` with divergent rules, is not transactional, and drops missed periods. | `computeNextExecution` (`setMonth` before `setDate`); cron inline advance; boot-time `setTimeout` | **OPEN** — approved |
+| **P0-4** | `PUT /api/recurring-rules/:id` did not allowlist `frequency`; an unknown value made the scheduler return the clock unchanged, so the rule refired and duplicated an expense on **every** run, permanently | was: PUT handler had no validation while POST did; `computeNextExecution` fall-through | **FIXED** — both write paths share one allowlist and return 400 `Invalid frequency.`; the scheduler skips an unusable schedule instead of advancing it. Tests: `test/p0/schedule.test.js` |
+| **P0-5** | MONTHLY scheduling skipped an entire month when the run day exceeded the target month's length (**31/31** day-of-month values affected). The cron duplicated the scheduler with divergent WEEKLY/YEARLY rules, was non-transactional, and dropped missed periods | was: `setMonth()` before `setDate()`; inline cron copy; separate insert + advance | **FIXED** — single implementation in `src/lib/schedule.js`, correct month-end/leap-year clamping, weekly honours `dayOfWeek`, catch-up with a documented cap, and conditional-claim idempotency inside one transaction. Before/after report: `docs/P0-5_SCHEDULE_CHANGE_REPORT.md` |
 | **P0-6** | Time-window inconsistencies: (a) month parsing is duplicated 3× and unvalidated (`?month=abc` → 500; out-of-range months silently roll over); (b) month windows exclude the final second (`.001`–`.999`) because the end boundary has `milliseconds = 0`; (c) **the echoed `month` label is derived via `toISOString().slice(0,7)` and is therefore server-timezone dependent** — on a host east of UTC, `?month=2026-03` returns `month: "2026-02"`; (d) `FE:` dashboard mixes three windows on one screen; budget progress ignores `b.period` and clamps overspend at 100% | `src/server.js` dashboard/stats/incomes month blocks; `FE: src/components/Dashboard/Dashboard.jsx:28-34,56,68`; `FE: BudgetProgress.jsx:25` | **OPEN** — approved |
 | **P0-7** | Migration/constraint verification | — | **BLOCKED** — see the environment finding below. No Prisma command may be run against the single configured target until a dedicated non-production branch is confirmed |
 
@@ -35,6 +35,33 @@ The backend has **exactly one** environment file (`.env`) and **exactly one** `D
 ### P0-2 Phase B design decision (recorded)
 
 The approved design compared the token's `iat` against a new `passwordChangedAt` timestamp. **This was superseded by a per-user `tokenVersion` counter**, at your invitation to propose a stronger alternative. Verification showed a concrete defect in the timestamp design: `iat` has **second** precision while a DB timestamp has **millisecond** precision, so a session issued in the same second as a password change can compare as older and be **wrongly rejected**. Truncating the stored timestamp fixes that but opens a **one-second grace window** in which a stolen pre-change token still works. The counter removes the clock from the decision entirely (integer equality: no skew, no tolerance, no instance-clock dependence) and both designs need the same single user read per request. The hazard and the grace window are both demonstrated by test in `test/p0/session-revocation.test.js`. The migration is unapplied, so reverting to the timestamp design is a small, isolated change.
+
+### Added to P0 by review decision — authentication findings
+
+| ID | Defect | Evidence | Status |
+|----|--------|----------|--------|
+| **A-1** | **PINLock interferes with the public login and password-recovery routes.** `App.jsx` returns `<PINLock>` *before* `<Routes>`, so when `web_pin` is set it gates the entire app — including `/login`, `/forgot-password` and the new `/reset-password`. A locked-out user must pass a device PIN to reach the screens that exist to recover access. `web_pin` is never written by any UI, so this is latent rather than live. | `FE: src/App.jsx` (PINLock branch precedes `<Routes>`); `grep -rn "web_pin" src/` shows no writer | **OPEN** — fix prepared (below) |
+| **A-2** | **Forgot-password account enumeration.** `POST /api/auth/forgot-password` returns `404 "No user found with this email."` for an unknown address versus `200` for a known one, so an attacker can confirm which emails are registered. There is also **no rate limiting** on any auth endpoint, so the endpoint doubles as a mail-bomb primitive. | `src/server.js` forgot-password handler (`if (!user) return res.status(404)`) | **OPEN** — fix prepared (below) |
+
+#### A-1 prepared fix (frontend only, no schema, no DB)
+
+Move the PIN gate so it protects **only authenticated financial screens**, never the public auth routes.
+
+- Keep `PINLock` exactly as strong as it is for the app shell: the gate should wrap the authenticated layout, not precede `<Routes>`.
+- Concretely: leave `/login`, `/register`, `/forgot-password` and `/reset-password` reachable without the PIN, and render the PIN gate only for routes that require a session (i.e. inside the `token`-gated branch, or as a layout element around those routes).
+- **Do not weaken PIN protection** for authenticated financial screens — those keep the same gate and the same behaviour. This is a routing-order change, not a reduction in protection.
+- Recommend adding a "Forgot PIN?" affordance that clears `web_pin` **only after** a successful password reset, so a forgotten PIN is not a second lockout.
+- Tests: assert the four public routes render while `web_pin` is set; assert financial routes still show the PIN gate.
+
+#### A-2 prepared fix (small, no dependency)
+
+1. **Consistent public response.** Always return the same `200 { message: 'If that email is registered, a reset link has been sent.' }` regardless of whether the account exists, and only send mail when it does. This removes the enumeration oracle with **no change to the request contract** — the frontend already shows a generic "check your email" state.
+2. **Rate limiting.** Not yet implemented, because the choice has a real trade-off and I will not pick it silently:
+   - *(a) In-process limiter, zero dependencies.* Protects a single instance; **does not** hold across multiple Render instances or restarts. Honest but partial.
+   - *(b) `express-rate-limit` + a shared store (e.g. Redis/Upstash).* Correct across instances; adds a dependency and external service to operate.
+   - *(c) Platform-level limiting at the edge.* No code; depends on the hosting tier.
+   **Recommendation: (a) now to raise the cost immediately, then (b) when a shared store is acceptable.** The limiter must key on IP **and** the submitted email, must not reveal whether the email exists, and must apply to `/login`, `/register`, `/forgot-password` and `/reset-password`.
+3. Also recommended alongside: log the enumeration attempts rather than only rate-limiting them.
 
 ### Added to P0 by review decision
 
