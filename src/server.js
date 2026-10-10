@@ -8,6 +8,16 @@ const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const cron = require('node-cron');
 const { google } = require('googleapis');
+const {
+  signSessionToken,
+  signResetToken,
+  isSessionPayload,
+  isResetPayload,
+  passwordFingerprint,
+  fingerprintsMatch,
+  validateNewPassword,
+  buildResetConsumeArgs,
+} = require('./lib/auth-tokens');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -36,6 +46,15 @@ const authenticateToken = (req, res, next) => {
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) {
+      return res.status(401).json({
+        error: 'Invalid or expired token.',
+      });
+    }
+
+    // P0-2: a password-reset token must never authenticate an API request.
+    // Pre-P0-2 a reset link was a fully valid Bearer token for its whole TTL.
+    // Legacy session tokens carry no `purpose` claim and are still accepted.
+    if (!isSessionPayload(user)) {
       return res.status(401).json({
         error: 'Invalid or expired token.',
       });
@@ -366,15 +385,9 @@ app.post('/api/auth/register', async (req, res) => {
 
     await seedCategories(user.id);
 
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-      },
-      process.env.JWT_SECRET,
-      {
-        expiresIn: '30d',
-      }
+    const token = signSessionToken(
+      user,
+      process.env.JWT_SECRET
     );
 
     res.status(201).json({
@@ -431,15 +444,9 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-      },
-      process.env.JWT_SECRET,
-      {
-        expiresIn: '30d',
-      }
+    const token = signSessionToken(
+      user,
+      process.env.JWT_SECRET
     );
 
     res.json({
@@ -480,14 +487,11 @@ app.post(
         });
       }
 
-      const resetToken = jwt.sign(
-        {
-          id: user.id,
-        },
-        process.env.JWT_SECRET,
-        {
-          expiresIn: '1h',
-        }
+      // P0-2: typed, short-lived, and bound to the password hash in force at
+      // issue time, so the link is spent as soon as the password changes.
+      const resetToken = signResetToken(
+        user,
+        process.env.JWT_SECRET
       );
 
       const resetLink =
@@ -504,7 +508,7 @@ app.post(
           `<p>Hi ${user.name || 'there'},</p>` +
           `<p>Click <a href="${resetLink}">here</a> ` +
           `to reset your password. ` +
-          `This link expires in 1 hour.</p>`,
+          `This link expires in 15 minutes.</p>`,
       });
 
       res.json({
@@ -529,10 +533,67 @@ app.post(
         newPassword,
       } = req.body;
 
-      const decoded = jwt.verify(
-        token,
-        process.env.JWT_SECRET
-      );
+      // P0-2: password strength was previously not validated at all.
+      const passwordError =
+        validateNewPassword(newPassword);
+
+      if (passwordError) {
+        return res.status(400).json({
+          error: passwordError,
+        });
+      }
+
+      let decoded;
+
+      try {
+        decoded = jwt.verify(
+          token,
+          process.env.JWT_SECRET
+        );
+      } catch (err) {
+        return res.status(400).json({
+          error: 'Invalid or expired token.',
+        });
+      }
+
+      // P0-2: only a token explicitly issued for password reset is accepted
+      // here. Pre-P0-2 any valid JWT worked, so a stolen session token could
+      // be replayed to overwrite the password.
+      if (!isResetPayload(decoded)) {
+        return res.status(400).json({
+          error: 'Invalid or expired token.',
+        });
+      }
+
+      const user = await prisma.user.findUnique({
+        where: { id: decoded.id },
+        select: { id: true, password: true },
+      });
+
+      if (!user) {
+        return res.status(400).json({
+          error: 'Invalid or expired token.',
+        });
+      }
+
+      // P0-2: the token is bound to the password hash that was in force when
+      // it was issued. Once the password changes, outstanding links are spent.
+      const currentFingerprint =
+        passwordFingerprint(
+          user.password,
+          process.env.JWT_SECRET
+        );
+
+      if (
+        !fingerprintsMatch(
+          currentFingerprint,
+          decoded.pwd
+        )
+      ) {
+        return res.status(400).json({
+          error: 'Invalid or expired token.',
+        });
+      }
 
       const hashed =
         await bcrypt.hash(
@@ -540,14 +601,27 @@ app.post(
           10
         );
 
-      await prisma.user.update({
-        where: {
-          id: decoded.id,
-        },
-        data: {
-          password: hashed,
-        },
-      });
+      // P0-2: single-use is enforced atomically. updateMany() puts the stored
+      // digest in the WHERE clause, so UPDATE ... WHERE id = ? AND password = ?
+      // can match for exactly one concurrent request; every other sees
+      // count === 0 and is rejected as a spent token.
+      const consumeArgs =
+        buildResetConsumeArgs(
+          user.id,
+          user.password,
+          hashed
+        );
+
+      const consumed =
+        await prisma.user.updateMany(
+          consumeArgs
+        );
+
+      if (consumed.count === 0) {
+        return res.status(400).json({
+          error: 'Invalid or expired token.',
+        });
+      }
 
       res.json({
         message:
