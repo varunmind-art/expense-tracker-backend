@@ -9,11 +9,11 @@ datasource db {
 }
 
 model User {
-  id                String    @id @default(cuid())
-  email             String    @unique
+  id                String   @id @default(cuid())
+  email             String   @unique
   password          String
   name              String?
-  createdAt         DateTime  @default(now())
+  createdAt         DateTime @default(now())
   gmailRefreshToken String?
 
   categories     Category[]
@@ -22,18 +22,20 @@ model User {
   recurringRules RecurringRule[]
   pendingImports PendingImport[]
   incomes        Income[]
-  merchants      Merchant[]     // ⭐ NEW
+  merchants      Merchant[]
+  accounts       Account[]
+  loans          Loan[]
 }
 
 model Category {
-  id            String    @id @default(cuid())
-  name          String
-  icon          String?
-  color         String?
-  type          String    @default("EXPENSE") // ⭐ NEW: EXPENSE | SAVINGS
-  isDefault     Boolean   @default(false)
-  userId        String
-  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id        String  @id @default(cuid())
+  name      String
+  icon      String?
+  color     String?
+  type      String  @default("EXPENSE") // ⭐ NEW: EXPENSE | SAVINGS
+  isDefault Boolean @default(false)
+  userId    String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   expenses       Expense[]
   budgets        Budget[]
@@ -48,7 +50,7 @@ model Expense {
   amount      Decimal  @db.Decimal(10, 2)
   date        DateTime @default(now())
   note        String?
-  merchant    String?  // ⭐ NEW
+  merchant    String? // ⭐ NEW
   receiptUrl  String?
   isRecurring Boolean  @default(false)
   type        String   @default("EXPENSE") // EXPENSE | SAVINGS
@@ -56,6 +58,8 @@ model Expense {
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   categoryId  String
   category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  accountId   String?
+  account     Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -110,10 +114,12 @@ model Income {
   id        String   @id @default(cuid())
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  source    String   @default("SALARY") // SALARY | FREELANCE | DIVIDEND | RENT | OTHER
+  source    String   @default("SALARY")
   amount    Decimal  @db.Decimal(10, 2)
   date      DateTime @default(now())
   note      String?
+  accountId String?
+  account   Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
@@ -121,11 +127,88 @@ model Income {
 model Merchant {
   id        String   @id @default(cuid())
   name      String
-  aliases   String[] @default([])   // ⭐ NEW
+  aliases   String[] @default([]) // ⭐ NEW
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
 
   @@unique([userId, name])
+}
+
+model Account {
+  id          String  @id @default(cuid())
+  name        String
+  type        String
+  institution String?
+  last4       String?
+  currency    String  @default("INR")
+  isActive    Boolean @default(true)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  expenses Expense[]
+  incomes  Income[]
+  loans    Loan[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
+model Loan {
+  id       String  @id @default(cuid())
+  name     String
+  lender   String?
+  loanType String  @default("HOME_LOAN")
+
+  originalPrincipal Decimal @db.Decimal(14, 2)
+  currentPrincipal  Decimal @db.Decimal(14, 2)
+
+  interestRate Decimal? @db.Decimal(6, 3)
+  emiAmount    Decimal? @db.Decimal(14, 2)
+
+  startDate DateTime?
+  endDate   DateTime?
+  emiDay    Int?
+
+  isActive Boolean @default(true)
+
+  paymentAccountId String?
+  paymentAccount   Account? @relation(fields: [paymentAccountId], references: [id], onDelete: SetNull)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  payments LoanPayment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model LoanPayment {
+  id String @id @default(cuid())
+
+  date DateTime
+
+  totalAmount     Decimal @db.Decimal(14, 2)
+  principalAmount Decimal @db.Decimal(14, 2)
+  interestAmount  Decimal @db.Decimal(14, 2)
+  extraPrincipal  Decimal @default(0) @db.Decimal(14, 2)
+
+  outstandingAfter Decimal? @db.Decimal(14, 2)
+
+  note String?
+
+  loanId String
+  loan   Loan   @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([loanId])
 }
