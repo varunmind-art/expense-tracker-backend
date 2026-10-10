@@ -209,7 +209,9 @@ test('the consume query pins the stored digest so exactly one writer can win', (
   const args = buildResetConsumeArgs('user_1', '$old$digest', '$new$digest');
   assert.deepEqual(args, {
     where: { id: 'user_1', password: '$old$digest' },
-    data: { password: '$new$digest' },
+    // Phase B adds the revocation marker to the SAME data object, so the
+    // password change and the session revocation commit in one statement.
+    data: { password: '$new$digest', tokenVersion: { increment: 1 } },
   });
   // The digest in the WHERE clause is what makes consumption atomic: a second
   // concurrent request no longer matches once the first update commits.

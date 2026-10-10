@@ -14,10 +14,23 @@
  * This module makes token purpose explicit in both directions and gives reset
  * tokens single-use semantics without any schema change.
  *
- * Phase B (separate change, requires schema approval) adds `passwordChangedAt`
- * so that a password change revokes previously issued SESSION tokens. Until
- * Phase B ships and is verified, session revocation is NOT provided — see
- * test/p0/auth-tokens.test.js and the P0-2 report.
+ * Phase B (this file, schema approval pending application) adds a monotonic
+ * per-user `tokenVersion`. Every session token embeds the version it was issued
+ * under; a password change increments the stored version, which invalidates
+ * every previously issued session token for that user.
+ *
+ * Why a version counter rather than comparing the token's `iat` against a
+ * `passwordChangedAt` timestamp — the design that was originally approved:
+ *   - JWT `iat` has SECOND precision while a DB timestamp has millisecond
+ *     precision, so a token issued in the same second as the change can compare
+ *     as "older" and be wrongly rejected. A counter has no clock at all.
+ *   - It needs no clock-skew tolerance and behaves identically across instances
+ *     regardless of their clocks.
+ *   - Revocation is exact equality, so there is no grace window in which a
+ *     stolen pre-change token still works.
+ *   - It also gives "sign out everywhere" for free.
+ * Both designs require one user read per authenticated request, so the counter
+ * costs nothing extra. See test/p0/session-revocation.test.js.
  */
 
 const crypto = require('crypto');
@@ -38,6 +51,14 @@ const MIN_PASSWORD_LENGTH = 8;
 
 /** bcrypt silently truncates input beyond 72 bytes; reject instead. */
 const MAX_PASSWORD_BYTES = 72;
+
+/**
+ * Version stamped into new session tokens when the user row has no usable
+ * value, and the value assumed for tokens minted before Phase B (which carry no
+ * `ver` claim). Both are 0, which is also the column default, so deploying
+ * Phase B does not invalidate any existing session.
+ */
+const DEFAULT_TOKEN_VERSION = 0;
 
 /**
  * Keyed fingerprint of a stored password hash.
@@ -73,17 +94,61 @@ const fingerprintsMatch = (a, b) => {
   return crypto.timingSafeEqual(bufA, bufB);
 };
 
-/** Session token: carries `email` as before, plus an explicit purpose. */
+/** Session token: carries `email` as before, plus purpose and token version. */
 const signSessionToken = (user, secret, options = {}) =>
   jwt.sign(
     {
       id: user.id,
       email: user.email,
       purpose: PURPOSE.SESSION,
+      ver: normaliseTokenVersion(user.tokenVersion),
     },
     secret,
     { expiresIn: options.expiresIn || SESSION_TTL }
   );
+
+/**
+ * Coerce a stored tokenVersion to a safe integer.
+ * Anything missing, negative, fractional or non-numeric becomes 0.
+ */
+function normaliseTokenVersion(value) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    // Prisma may hand back a number; guard against undefined for new users.
+    return DEFAULT_TOKEN_VERSION;
+  }
+  return value;
+}
+
+/**
+ * The version a token was issued under. A token with no `ver` claim predates
+ * Phase B and is treated as version 0, matching the column default, so existing
+ * sessions keep working across the deploy.
+ */
+const tokenVersionOf = (payload) => {
+  if (!isPlainPayload(payload)) {
+    return null;
+  }
+  if (payload.ver === undefined) {
+    return DEFAULT_TOKEN_VERSION;
+  }
+  if (typeof payload.ver !== 'number' || !Number.isInteger(payload.ver) || payload.ver < 0) {
+    return null; // malformed claim: treat as unverifiable, never as current
+  }
+  return payload.ver;
+};
+
+/**
+ * True only when the token's version matches the user's current version.
+ * Pure integer comparison: no clock, so second-precision and timezone issues
+ * cannot cause wrong accept/reject decisions.
+ */
+const isSessionVersionCurrent = (payload, currentVersion) => {
+  const issued = tokenVersionOf(payload);
+  if (issued === null) {
+    return false;
+  }
+  return issued === normaliseTokenVersion(currentVersion);
+};
 
 /**
  * Reset token: carries ONLY the user id plus a fingerprint of the password hash
@@ -162,13 +227,19 @@ const validateNewPassword = (password) => {
 };
 
 /**
- * Arguments for the compare-and-swap that consumes a reset token exactly once.
+ * Arguments for the compare-and-swap that consumes a reset token exactly once
+ * AND revokes every previously issued session for the user.
  *
  * `updateMany` (not `update`) is used so the stored digest participates in the
  * WHERE clause: the UPDATE ... WHERE id = ? AND password = ? statement is
  * atomic, so of N concurrent requests with the same valid token exactly one
  * matches and receives count === 1. Every other receives count === 0 and is
  * rejected. This is what makes single-use real rather than best-effort.
+ *
+ * `tokenVersion: { increment: 1 }` rides in the SAME `data` object, so the
+ * password change and the session-revocation marker are written by one
+ * statement and cannot diverge — there is no window where the password has
+ * changed but old sessions are still valid.
  */
 const buildResetConsumeArgs = (userId, currentPasswordDigest, newPasswordHash) => ({
   where: {
@@ -177,6 +248,7 @@ const buildResetConsumeArgs = (userId, currentPasswordDigest, newPasswordHash) =
   },
   data: {
     password: newPasswordHash,
+    tokenVersion: { increment: 1 },
   },
 });
 
@@ -186,6 +258,10 @@ module.exports = {
   RESET_TTL,
   MIN_PASSWORD_LENGTH,
   MAX_PASSWORD_BYTES,
+  DEFAULT_TOKEN_VERSION,
+  normaliseTokenVersion,
+  tokenVersionOf,
+  isSessionVersionCurrent,
   passwordFingerprint,
   fingerprintsMatch,
   signSessionToken,

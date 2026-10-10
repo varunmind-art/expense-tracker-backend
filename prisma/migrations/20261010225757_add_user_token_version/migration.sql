@@ -1,0 +1,13 @@
+-- AlterTable
+-- P0-2 Phase B: session revocation counter.
+--
+-- Purely additive: a new NOT NULL column WITH A DEFAULT. PostgreSQL 11+
+-- backfills the default for existing rows without a table rewrite, so every
+-- existing user gets tokenVersion = 0 and can continue to authenticate with
+-- tokens issued before this change (those tokens carry no `ver` claim, which is
+-- read as 0).
+--
+-- No existing column is altered, no row is updated, no data is removed.
+-- A password change increments this counter, which revokes every previously
+-- issued session token for that user.
+ALTER TABLE "User" ADD COLUMN     "tokenVersion" INTEGER NOT NULL DEFAULT 0;

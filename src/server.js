@@ -13,6 +13,7 @@ const {
   signResetToken,
   isSessionPayload,
   isResetPayload,
+  isSessionVersionCurrent,
   passwordFingerprint,
   fingerprintsMatch,
   validateNewPassword,
@@ -34,7 +35,7 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -44,25 +45,66 @@ const authenticateToken = (req, res, next) => {
     });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(401).json({
-        error: 'Invalid or expired token.',
-      });
-    }
+  let payload;
 
-    // P0-2: a password-reset token must never authenticate an API request.
-    // Pre-P0-2 a reset link was a fully valid Bearer token for its whole TTL.
-    // Legacy session tokens carry no `purpose` claim and are still accepted.
-    if (!isSessionPayload(user)) {
-      return res.status(401).json({
-        error: 'Invalid or expired token.',
-      });
-    }
+  try {
+    payload = jwt.verify(
+      token,
+      process.env.JWT_SECRET
+    );
+  } catch (err) {
+    return res.status(401).json({
+      error: 'Invalid or expired token.',
+    });
+  }
 
-    req.user = user;
-    next();
-  });
+  // P0-2: a password-reset token must never authenticate an API request.
+  // Pre-P0-2 a reset link was a fully valid Bearer token for its whole TTL.
+  // Legacy session tokens carry no `purpose` claim and are still accepted.
+  if (!isSessionPayload(payload)) {
+    return res.status(401).json({
+      error: 'Invalid or expired token.',
+    });
+  }
+
+  // P0-2 Phase B: session revocation. A password change increments the user's
+  // tokenVersion, so every token issued under an older version is rejected.
+  // This is the one place a per-request database read is now required; it is
+  // an indexed primary-key lookup selecting a single column.
+  let account;
+
+  try {
+    account = await prisma.user.findUnique({
+      where: { id: payload.id },
+      select: { tokenVersion: true },
+    });
+  } catch (error) {
+    // A database failure is NOT an authentication failure: returning 401 here
+    // would log every user out during an outage.
+    console.error(
+      'Token-version lookup failed:',
+      error
+    );
+    return res.status(500).json({
+      error: 'Authentication temporarily unavailable.',
+    });
+  }
+
+  // Covers a deleted user (account === null) as well as a revoked session.
+  if (
+    !account ||
+    !isSessionVersionCurrent(
+      payload,
+      account.tokenVersion
+    )
+  ) {
+    return res.status(401).json({
+      error: 'Invalid or expired token.',
+    });
+  }
+
+  req.user = payload;
+  next();
 };
 
 // ==========================================

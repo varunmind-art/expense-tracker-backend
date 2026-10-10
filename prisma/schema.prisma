@@ -15,6 +15,7 @@ model User {
   name              String?
   createdAt         DateTime @default(now())
   gmailRefreshToken String?
+  tokenVersion      Int      @default(0)
 
   categories     Category[]
   expenses       Expense[]
