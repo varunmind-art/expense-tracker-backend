@@ -40,6 +40,9 @@ const {
   planResetRequest,
   planResetDelivery,
 } = require('./lib/auth-responses');
+const {
+  authorizeCategory,
+} = require('./lib/authorization');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -360,6 +363,23 @@ const getOwnedAccount = async (
     },
   });
 };
+
+/**
+ * P0-8: the Prisma-backed lookup behind authorizeCategory. It MUST filter by
+ * userId; the helper is what enforces the decision, this is only the query.
+ */
+const findOwnedCategory = (args) =>
+  prisma.category.findFirst({
+    where: {
+      id: args.id,
+      userId: args.userId,
+    },
+    select: {
+      id: true,
+      userId: true,
+      type: true,
+    },
+  });
 
 // ==========================================
 // 1. AUTH
@@ -790,6 +810,23 @@ app.post(
         accountId,
       } = req.body;
 
+      // P0-8: the category must belong to the authenticated user. A foreign id
+      // and a nonexistent one both yield the same 400, so the response cannot be
+      // used to probe for another user's categories.
+      const categoryCheck = await authorizeCategory(
+        findOwnedCategory,
+        req.user.id,
+        categoryId
+      );
+
+      if (!categoryCheck.ok) {
+        return res
+          .status(categoryCheck.status)
+          .json({
+            error: categoryCheck.error,
+          });
+      }
+
       const rawMerchant =
         normaliseMerchant(merchant);
 
@@ -874,6 +911,23 @@ app.put(
         type,
         accountId,
       } = req.body;
+
+      // P0-8: the category must belong to the authenticated user. A foreign id
+      // and a nonexistent one both yield the same 400, so the response cannot be
+      // used to probe for another user's categories.
+      const categoryCheck = await authorizeCategory(
+        findOwnedCategory,
+        req.user.id,
+        categoryId
+      );
+
+      if (!categoryCheck.ok) {
+        return res
+          .status(categoryCheck.status)
+          .json({
+            error: categoryCheck.error,
+          });
+      }
 
       if (accountId) {
         const account =
@@ -3204,6 +3258,23 @@ app.post(
         categoryId,
       } = req.body;
 
+      // P0-8: the category must belong to the authenticated user. A foreign id
+      // and a nonexistent one both yield the same 400, so the response cannot be
+      // used to probe for another user's categories.
+      const categoryCheck = await authorizeCategory(
+        findOwnedCategory,
+        req.user.id,
+        categoryId
+      );
+
+      if (!categoryCheck.ok) {
+        return res
+          .status(categoryCheck.status)
+          .json({
+            error: categoryCheck.error,
+          });
+      }
+
       const budget =
         await prisma.budget.create({
           data: {
@@ -3262,6 +3333,23 @@ app.put(
         categoryId,
         startDate,
       } = req.body;
+
+      // P0-8: the category must belong to the authenticated user. A foreign id
+      // and a nonexistent one both yield the same 400, so the response cannot be
+      // used to probe for another user's categories.
+      const categoryCheck = await authorizeCategory(
+        findOwnedCategory,
+        req.user.id,
+        categoryId
+      );
+
+      if (!categoryCheck.ok) {
+        return res
+          .status(categoryCheck.status)
+          .json({
+            error: categoryCheck.error,
+          });
+      }
 
       const existing =
         await prisma.budget.findFirst({
@@ -3410,6 +3498,23 @@ app.post(
         categoryId,
       } = req.body;
 
+      // P0-8: the category must belong to the authenticated user. A foreign id
+      // and a nonexistent one both yield the same 400, so the response cannot be
+      // used to probe for another user's categories.
+      const categoryCheck = await authorizeCategory(
+        findOwnedCategory,
+        req.user.id,
+        categoryId
+      );
+
+      if (!categoryCheck.ok) {
+        return res
+          .status(categoryCheck.status)
+          .json({
+            error: categoryCheck.error,
+          });
+      }
+
       if (
         !description ||
         !amount ||
@@ -3507,6 +3612,23 @@ app.put(
         categoryId,
         isActive,
       } = req.body;
+
+      // P0-8: the category must belong to the authenticated user. A foreign id
+      // and a nonexistent one both yield the same 400, so the response cannot be
+      // used to probe for another user's categories.
+      const categoryCheck = await authorizeCategory(
+        findOwnedCategory,
+        req.user.id,
+        categoryId
+      );
+
+      if (!categoryCheck.ok) {
+        return res
+          .status(categoryCheck.status)
+          .json({
+            error: categoryCheck.error,
+          });
+      }
 
       const existing =
         await prisma.recurringRule.findFirst({
@@ -4639,6 +4761,23 @@ app.put(
       categoryId,
     } = req.body;
 
+      // P0-8: the category must belong to the authenticated user. A foreign id
+      // and a nonexistent one both yield the same 400, so the response cannot be
+      // used to probe for another user's categories.
+      const categoryCheck = await authorizeCategory(
+        findOwnedCategory,
+        req.user.id,
+        categoryId
+      );
+
+      if (!categoryCheck.ok) {
+        return res
+          .status(categoryCheck.status)
+          .json({
+            error: categoryCheck.error,
+          });
+      }
+
     try {
       const pending =
         await prisma.pendingImport.update({
@@ -4709,6 +4848,23 @@ app.post(
     const {
       categoryId,
     } = req.body;
+
+      // P0-8: the category must belong to the authenticated user. A foreign id
+      // and a nonexistent one both yield the same 400, so the response cannot be
+      // used to probe for another user's categories.
+      const categoryCheck = await authorizeCategory(
+        findOwnedCategory,
+        req.user.id,
+        categoryId
+      );
+
+      if (!categoryCheck.ok) {
+        return res
+          .status(categoryCheck.status)
+          .json({
+            error: categoryCheck.error,
+          });
+      }
 
     try {
       const pending =
