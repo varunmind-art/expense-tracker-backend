@@ -320,15 +320,139 @@ test('P0-5: repeated cron execution creates no duplicate transactions', { todo: 
   assert.equal(thrice, once, `repeat runs must not duplicate (once=${once}, thrice=${thrice})`);
 });
 
-test('P0-5: two concurrent workers do not duplicate a period', { todo: 'not yet verified: assertions assume a fresh/advancing state, but the development database persists between runs; needs a deterministic time-controlled harness. See the P0-7 report.' }, async () => {
-  const before = await recurringCountFor('P07 overdue monthly');
-  await Promise.all([processRecurringExpenses(), processRecurringExpenses()]);
-  const after = await recurringCountFor('P07 overdue monthly');
-  // Both workers may each claim different periods, but no single period may be
-  // claimed twice, so the total must equal the number of distinct due periods.
-  const rule = await prisma.recurringRule.findUnique({ where: { id: ID.ruleOverdue } });
-  assert.ok(after >= before);
-  assert.ok(rule.nextExecution > new Date('2026-03-16T00:00:00Z'), 'the rule must have advanced past the overdue window');
+test('P0-5: two concurrent workers cannot duplicate a period (10 independent runs)', async () => {
+  const { PrismaClient } = require('@prisma/client');
+
+  // Deterministic clock and a single overdue occurrence: nextExecution is the
+  // application-local midnight of the same civil day the clock reports, so
+  // exactly one period is due and its advanced value is known in advance.
+  const NOW = new Date('2026-10-11T00:00:00.000Z');
+  const DUE = new Date('2026-10-11T00:00:00.000+05:30');
+  const EXPECTED_NEXT = new Date('2026-11-11T00:00:00.000+05:30');
+
+  // A thin delegating wrapper: every operation still runs on the REAL client,
+  // but the conditional claim's row count is recorded, which is how "exactly one
+  // worker claimed" is observed rather than assumed.
+  const wrap = (client, tag, log) => ({
+    recurringRule: {
+      findMany: (a) => client.recurringRule.findMany(a),
+      findUnique: (a) => client.recurringRule.findUnique(a),
+    },
+    merchant: {
+      findFirst: (a) => client.merchant.findFirst(a),
+      create: (a) => client.merchant.create(a),
+      update: (a) => client.merchant.update(a),
+    },
+    $transaction: (fn, opts) =>
+      client.$transaction(
+        (tx) =>
+          fn({
+            recurringRule: {
+              updateMany: async (a) => {
+                const r = await tx.recurringRule.updateMany(a);
+                // Attribute the claim to its rule: processRecurringExpenses
+                // loads every active due rule, so a raw count would include
+                // unrelated fixtures.
+                log.push({ tag, ruleId: a && a.where && a.where.id, claimedRows: r.count });
+                return r;
+              },
+            },
+            expense: { create: (a) => tx.expense.create(a) },
+          }),
+        opts
+      ),
+  });
+
+  const results = [];
+
+  for (let run = 1; run <= 10; run += 1) {
+    const ruleId = `${PREFIX}race-${Date.now()}-${String(run).padStart(2, '0')}`;
+    await prisma.recurringRule.create({
+      data: {
+        id: ruleId, description: ruleId, amount: '175.00', frequency: 'MONTHLY',
+        dayOfMonth: 11, nextExecution: DUE, isActive: true,
+        userId: ID.userA, categoryId: ID.catAExpense,
+      },
+    });
+
+    const clientA = new PrismaClient();
+    const clientB = new PrismaClient();
+    const log = [];
+
+    // Both workers must observe the occurrence as eligible before competing.
+    const seenA = await clientA.recurringRule.findUnique({ where: { id: ruleId } });
+    const seenB = await clientB.recurringRule.findUnique({ where: { id: ruleId } });
+    assert.equal(
+      seenA.nextExecution.getTime(),
+      seenB.nextExecution.getTime(),
+      `run ${run}: both workers must observe the same eligible timestamp`
+    );
+    assert.equal(seenA.nextExecution.getTime(), DUE.getTime(), `run ${run}: the occurrence is due now`);
+
+    // Deterministic start gate: both workers are parked on the same promise and
+    // released in one tick, so neither is merely sequential. The gate is outside
+    // any transaction, so it cannot hold a lock.
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const worker = async (client, tag) => {
+      await gate;
+      return processRecurringExpenses({ prisma: wrap(client, tag, log), now: NOW });
+    };
+
+    const pendingA = worker(clientA, 'A');
+    const pendingB = worker(clientB, 'B');
+    release();
+    await Promise.race([
+      Promise.all([pendingA, pendingB]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`run ${run}: workers timed out`)), 30000)),
+    ]);
+
+    const expenses = await prisma.expense.findMany({
+      where: { userId: ID.userA, note: { contains: ruleId } },
+      select: { date: true, amount: true, categoryId: true },
+    });
+    const rule = await prisma.recurringRule.findUnique({ where: { id: ruleId } });
+
+    await clientA.$disconnect();
+    await clientB.$disconnect();
+
+    results.push({
+      run,
+      successfulClaims: log.filter((l) => l.ruleId === ruleId && l.claimedRows === 1).length,
+      losingAttempts: log.filter((l) => l.ruleId === ruleId && l.claimedRows === 0).length,
+      expenses: expenses.length,
+      date: expenses[0] ? expenses[0].date.toISOString() : null,
+      amount: expenses[0] ? expenses[0].amount.toString() : null,
+      categoryId: expenses[0] ? expenses[0].categoryId : null,
+      nextExecution: rule.nextExecution.toISOString(),
+    });
+  }
+
+  process.stdout.write(
+    `    per-run claims/expenses: ${results.map((r) => `${r.successfulClaims}/${r.expenses}`).join(' ')}\n`
+  );
+
+  const failures = results.filter(
+    (r) =>
+      r.successfulClaims !== 1 ||
+      r.expenses !== 1 ||
+      r.nextExecution !== EXPECTED_NEXT.toISOString() ||
+      r.date !== DUE.toISOString() ||
+      r.amount !== '175' ||
+      r.categoryId !== ID.catAExpense
+  );
+  assert.deepEqual(
+    failures,
+    [],
+    `every run must commit exactly one claim and one expense with the correct fields: ${JSON.stringify(failures, null, 2)}`
+  );
+
+  // 7. a later execution must not duplicate any of the ten occurrences
+  await processRecurringExpenses({ now: NOW });
+  const total = await prisma.expense.count({
+    where: { userId: ID.userA, note: { contains: `${PREFIX}race-` } },
+  });
+  assert.equal(total, 10, `ten runs must leave exactly ten expenses, got ${total}`);
 });
 
 test('P0-5: month-end and leap-year rules advance without skipping months', { todo: 'not yet verified: assertions assume a fresh/advancing state, but the development database persists between runs; needs a deterministic time-controlled harness. See the P0-7 report.' }, async () => {
