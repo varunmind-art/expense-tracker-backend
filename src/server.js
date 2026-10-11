@@ -817,7 +817,8 @@ app.post(
       const categoryCheck = await authorizeCategory(
         findOwnedCategory,
         req.user.id,
-        categoryId
+        categoryId,
+        { requireValue: true }
       );
 
       if (!categoryCheck.ok) {
@@ -919,7 +920,8 @@ app.put(
       const categoryCheck = await authorizeCategory(
         findOwnedCategory,
         req.user.id,
-        categoryId
+        categoryId,
+        { rejectNull: true }
       );
 
       if (!categoryCheck.ok) {
@@ -3270,7 +3272,8 @@ app.post(
       const categoryCheck = await authorizeCategory(
         findOwnedCategory,
         req.user.id,
-        categoryId
+        categoryId,
+        { requireValue: true }
       );
 
       if (!categoryCheck.ok) {
@@ -3346,7 +3349,8 @@ app.put(
       const categoryCheck = await authorizeCategory(
         findOwnedCategory,
         req.user.id,
-        categoryId
+        categoryId,
+        { rejectNull: true }
       );
 
       if (!categoryCheck.ok) {
@@ -3510,7 +3514,8 @@ app.post(
       const categoryCheck = await authorizeCategory(
         findOwnedCategory,
         req.user.id,
-        categoryId
+        categoryId,
+        { requireValue: true }
       );
 
       if (!categoryCheck.ok) {
@@ -3625,7 +3630,8 @@ app.put(
       const categoryCheck = await authorizeCategory(
         findOwnedCategory,
         req.user.id,
-        categoryId
+        categoryId,
+        { rejectNull: true }
       );
 
       if (!categoryCheck.ok) {

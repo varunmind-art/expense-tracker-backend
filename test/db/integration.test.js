@@ -348,3 +348,71 @@ test('P0-5: no cross-user leakage from the scheduler', async () => {
   const bExpenses = await prisma.expense.count({ where: { userId: ID.userB, isRecurring: true } });
   assert.equal(bExpenses, 0, 'user B has no recurring rules and must gain nothing');
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P2 — explicit null vs omitted, across all eight category-accepting paths
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('P2: explicit null categoryId is 400 on the six mandatory paths and stays valid on the two nullable paths', async () => {
+  const tokenA = await login('p07-user-a@example.invalid');
+
+  // Dedicated rows so this test never depends on what earlier tests consumed.
+  await prisma.pendingImport.createMany({
+    data: [
+      { id: `${PREFIX}null-p1`, userId: ID.userA, amount: '60.00', date: T.feb28, merchant: 'P07 Null 1', source: 'TEST', sourceId: `${PREFIX}null-src-1`, status: 'pending' },
+      { id: `${PREFIX}null-p2`, userId: ID.userA, amount: '70.00', date: T.feb28, merchant: 'P07 Null 2', source: 'TEST', sourceId: `${PREFIX}null-src-2`, status: 'pending' },
+    ],
+  });
+
+  const cases = [
+    ['POST /api/expenses', 'POST', '/api/expenses', { amount: 5, categoryId: null }, 400],
+    ['PUT /api/expenses/:id', 'PUT', `/api/expenses/${ID.expenseA2}`, { amount: 5, date: T.feb28.toISOString(), categoryId: null }, 400],
+    ['POST /api/budgets', 'POST', '/api/budgets', { amount: 5, period: 'MONTHLY', categoryId: null }, 400],
+    ['PUT /api/budgets/:id', 'PUT', `/api/budgets/${ID.budgetA1}`, { categoryId: null }, 400],
+    ['POST /api/recurring-rules', 'POST', '/api/recurring-rules', { description: 'p2', amount: 5, frequency: 'MONTHLY', categoryId: null }, 400],
+    ['PUT /api/recurring-rules/:id', 'PUT', `/api/recurring-rules/${ID.ruleWeekly}`, { categoryId: null }, 400],
+    ['PUT /api/pending/:id (nullable)', 'PUT', `/api/pending/${PREFIX}null-p1`, { amount: 65, date: T.feb28.toISOString(), categoryId: null }, 200],
+    ['POST /api/pending/:id/confirm (nullable)', 'POST', `/api/pending/${PREFIX}null-p2/confirm`, { categoryId: null }, 200],
+  ];
+
+  const results = [];
+  for (const [label, method, path, body, expected] of cases) {
+    const res = await api(method, path, { token: tokenA, body });
+    results.push(`${label} -> ${res.status}`);
+    assert.equal(res.status, expected, `${label}: expected ${expected}, got ${res.status} ${res.text}`);
+    assert.ok(res.status < 500, `${label} must not return 5xx`);
+    assert.equal(
+      /prisma|Invalid `|P20\d\d|invocation/i.test(res.text),
+      false,
+      `${label} must not leak Prisma internals: ${res.text}`
+    );
+  }
+  process.stdout.write(`    ${results.join(' | ')}\n`);
+});
+
+test('P2: an omitted categoryId on update still preserves the existing category', async () => {
+  const tokenA = await login('p07-user-a@example.invalid');
+  const before = await prisma.expense.findUnique({ where: { id: ID.expenseA2 }, select: { categoryId: true } });
+
+  const omitted = await api('PUT', `/api/expenses/${ID.expenseA2}`, {
+    token: tokenA,
+    body: { amount: 900, date: T.feb28.toISOString() },
+  });
+  assert.equal(omitted.status, 200, omitted.text);
+
+  const after = await prisma.expense.findUnique({ where: { id: ID.expenseA2 }, select: { categoryId: true } });
+  assert.equal(after.categoryId, before.categoryId, 'omitting the field must not change it');
+});
+
+test('P2: a foreign or nonexistent category is still rejected on create and update', async () => {
+  const tokenA = await login('p07-user-a@example.invalid');
+  for (const [label, method, path, body] of [
+    ['create expenses', 'POST', '/api/expenses', { amount: 5, categoryId: ID.catBSecret }],
+    ['create budgets', 'POST', '/api/budgets', { amount: 5, period: 'MONTHLY', categoryId: 'p07-nope' }],
+    ['update expenses', 'PUT', `/api/expenses/${ID.expenseA2}`, { amount: 5, date: T.feb28.toISOString(), categoryId: ID.catBSecret }],
+  ]) {
+    const res = await api(method, path, { token: tokenA, body });
+    assert.equal(res.status, 400, `${label}: ${res.text}`);
+    assert.equal(res.json.error, 'Invalid category.', label);
+  }
+});

@@ -32,8 +32,27 @@ const isUsableId = (value) => typeof value === 'string' && value.trim().length >
  *   `{ok: true, category: null}` means "no reference supplied", which callers
  *   treat as optional. A present-but-not-yours reference is always a 400.
  */
-const authorizeCategory = async (findOwned, userId, categoryId) => {
-  if (categoryId === undefined || categoryId === null || categoryId === '') {
+const authorizeCategory = async (findOwned, userId, categoryId, options = {}) => {
+  // `requireValue` (create paths): a category must be supplied at all.
+  // `rejectNull`   (update paths): omitting the field means "leave it alone",
+  //                but an explicit null is a client error, because Category is
+  //                NOT NULL for these models.
+  // Neither option (PendingImport): the column is nullable, so null is valid and
+  //                falls back to the pending record's own category or default.
+  const requireValue = options.requireValue === true;
+  const rejectNull = options.rejectNull === true;
+
+  if (categoryId === undefined) {
+    if (requireValue) {
+      return { ok: false, status: 400, error: INVALID_RESOURCE_ERROR };
+    }
+    return { ok: true, category: null };
+  }
+
+  if (categoryId === null || categoryId === '') {
+    if (requireValue || rejectNull) {
+      return { ok: false, status: 400, error: INVALID_RESOURCE_ERROR };
+    }
     return { ok: true, category: null };
   }
 
