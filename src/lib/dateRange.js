@@ -189,6 +189,109 @@ const isWithin = (window, instant) => {
   return time >= window.start.getTime() && time < window.end.getTime();
 };
 
+/**
+ * Build a Prisma date filter from optional `startDate` / `endDate` query
+ * parameters (P0-6B).
+ *
+ * Two accepted forms, because both are already in use:
+ *   - a calendar day `YYYY-MM-DD` is treated as an INCLUSIVE user-facing day, so
+ *     the internal upper bound becomes the exclusive start of the NEXT day.
+ *     Previously this used `lte: new Date(endDate)`, which silently excluded the
+ *     whole end day, because `new Date('2026-03-10')` is midnight.
+ *   - a full ISO instant is treated as an exact instant bound, and the end stays
+ *     inclusive so existing instant-based callers keep their meaning.
+ *
+ * @returns {{ok: true, dateFilter: object|null} | {ok: false, error: string}}
+ */
+const rangeFromQueryParams = (params, offsetMinutes = APP_UTC_OFFSET_MINUTES) => {
+  const start = params ? params.startDate : undefined;
+  const end = params ? params.endDate : undefined;
+
+  const hasStart = !(start === undefined || start === null || start === '');
+  const hasEnd = !(end === undefined || end === null || end === '');
+
+  if (!hasStart && !hasEnd) {
+    return { ok: true, dateFilter: null };
+  }
+
+  const dateFilter = {};
+
+  /**
+   * Resolve one bound.
+   * A calendar day is exact and validated. Anything else must be a FULL ISO
+   * instant (it must contain a time component). This matters: V8 silently rolls
+   * `new Date('2026-02-29')` forward to 1 March, so a lenient fallback would
+   * accept impossible dates.
+   */
+  const resolveBound = (value, label) => {
+    const raw = String(value).trim();
+
+    // A pure calendar day, validated against the real calendar.
+    const asDay = parseDate(raw);
+    if (asDay) {
+      return {
+        ok: true,
+        kind: 'day',
+        year: asDay.year,
+        monthIndex: asDay.monthIndex,
+        day: asDay.day,
+      };
+    }
+
+    // Anything else must carry a time component to count as an instant. This
+    // ordering matters: an ISO instant also starts with YYYY-MM-DD, so checking
+    // "looks like a date" before this would reject valid instants.
+    if (!raw.includes('T')) {
+      return {
+        ok: false,
+        error: `Invalid ${label}. Expected YYYY-MM-DD or an ISO date.`,
+      };
+    }
+
+    const instant = new Date(raw);
+    if (Number.isNaN(instant.getTime())) {
+      return {
+        ok: false,
+        error: `Invalid ${label}. Expected YYYY-MM-DD or an ISO date.`,
+      };
+    }
+
+    return { ok: true, kind: 'instant', instant };
+  };
+
+  if (hasStart) {
+    const bound = resolveBound(start, 'startDate');
+    if (!bound.ok) return bound;
+    dateFilter.gte =
+      bound.kind === 'day'
+        ? fromAppLocal(bound.year, bound.monthIndex, bound.day, offsetMinutes)
+        : bound.instant;
+  }
+
+  if (hasEnd) {
+    const bound = resolveBound(end, 'endDate');
+    if (!bound.ok) return bound;
+
+    if (bound.kind === 'day') {
+      // The user's end date is an inclusive calendar day, so the internal upper
+      // bound is the exclusive start of the following day.
+      const exclusive = fromAppLocal(bound.year, bound.monthIndex, bound.day + 1, offsetMinutes);
+      if (dateFilter.gte && exclusive <= dateFilter.gte) {
+        return { ok: false, error: 'Invalid range. endDate must not be before startDate.' };
+      }
+      dateFilter.lt = exclusive;
+    } else {
+      if (dateFilter.gte && bound.instant < dateFilter.gte) {
+        return { ok: false, error: 'Invalid range. endDate must not be before startDate.' };
+      }
+      // An exact instant keeps its previous inclusive meaning.
+      dateFilter.lte = bound.instant;
+    }
+  }
+
+  return { ok: true, dateFilter };
+};
+
 module.exports = {
   APP_UTC_OFFSET_MINUTES,
   parseMonth,
@@ -204,4 +307,5 @@ module.exports = {
   shiftMonths,
   dateFilterFor,
   isWithin,
+  rangeFromQueryParams,
 };

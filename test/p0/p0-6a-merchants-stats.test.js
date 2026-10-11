@@ -274,16 +274,21 @@ test('all three P0-6 endpoints share the same window semantics for ?month=', () 
   assert.match(stats, /isWithin\(prevWindow/, 'stats filters the previous month in memory');
 });
 
-test('KNOWN GAP: /api/incomes still accepts unvalidated startDate/endDate with an inclusive end', () => {
-  // Documented deliberately rather than silently changed. /api/incomes agrees
-  // with the other two endpoints on the ?month= path, but its optional
-  // startDate/endDate branch still parses arbitrary values and uses `lte`, so it
-  // is neither validated nor half-open. The frontend only sends ?month=, so this
-  // is latent. Fixing it changes an accepted input contract and is left for a
-  // decision rather than done unilaterally.
+test('the /api/incomes custom range is now validated and half-open (gap closed in P0-6B)', () => {
+  // This test previously documented a KNOWN GAP: the optional startDate/endDate
+  // branch parsed arbitrary values and used an inclusive `lte`, so it agreed
+  // with the other endpoints only on the ?month= path. P0-6B closed it, so the
+  // test now asserts the fixed behaviour instead of the gap.
   const incomes = SERVER.slice(SERVER.indexOf("app.get(\n  '/api/incomes',"), SERVER.indexOf("app.post(\n  '/api/incomes',"));
-  assert.match(incomes, /gte: new Date\(startDate\)/, 'unvalidated startDate');
-  assert.match(incomes, /lte: new Date\(endDate\)/, 'inclusive, unvalidated endDate');
+
+  assert.match(incomes, /rangeFromQueryParams\(/, 'the shared validated parser must be used');
+  assert.match(incomes, /if \(!custom\.ok\)/, 'invalid input must be rejected');
+  assert.match(incomes, /status\(400\)/, 'with a 400, not a 500');
+
+  // The unvalidated inclusive bound must be gone. The trailing comma matters:
+  // the explanatory comment in the handler quotes the old expression.
+  assert.equal(/gte: new Date\(startDate\),/.test(incomes), false, 'unvalidated startDate removed');
+  assert.equal(/lte: new Date\(endDate\),/.test(incomes), false, 'inclusive endDate removed');
 });
 
 test('the dashboard summary still preserves its documented response contract', () => {

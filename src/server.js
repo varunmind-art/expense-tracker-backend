@@ -34,6 +34,7 @@ const {
   previousMonthLabel,
   shiftMonths,
   isWithin,
+  rangeFromQueryParams,
 } = require('./lib/dateRange');
 const { buildExpenseCsv } = require('./lib/csv');
 const {
@@ -2598,18 +2599,23 @@ app.get(
           lt: window.end,
         };
       } else {
-        if (startDate) {
-          where.date = {
-            ...where.date,
-            gte: new Date(startDate),
-          };
+        // P0-6B: validated custom range. A calendar end date is inclusive to the
+        // user, so the internal bound becomes the exclusive start of the next
+        // day; previously `lte: new Date(endDate)` silently dropped the whole
+        // end day. Malformed or impossible dates are a 400, not a 500.
+        const custom = rangeFromQueryParams({
+          startDate,
+          endDate,
+        });
+
+        if (!custom.ok) {
+          return res.status(400).json({
+            error: custom.error,
+          });
         }
 
-        if (endDate) {
-          where.date = {
-            ...where.date,
-            lte: new Date(endDate),
-          };
+        if (custom.dateFilter) {
+          where.date = custom.dateFilter;
         }
       }
 
