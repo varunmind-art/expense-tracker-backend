@@ -3921,19 +3921,33 @@ const processRecurringExpenses =
               )
             : rawMerchant;
 
+        // P0-5A: keep the EXACT timestamp read from PostgreSQL for the
+        // concurrency claim, and keep the calendar occurrence date separate.
+        // Previously the normalised calendar date was used as the claim key, so
+        // any stored value that was not already at local midnight never matched:
+        // the claim returned 0, nothing was created and the rule never advanced.
+        //
+        // `expectedStored` is chained: the first iteration claims on the value as
+        // read, and each successful claim sets it to the value just written. A
+        // row stored under an older convention is therefore converted on its
+        // first successful claim, without touching historical financial records.
+        let expectedStored = rule.nextExecution;
+
         for (const period of due.periods) {
+          // Advance from the STORED value; computeNextExecution normalises
+          // internally, so the resulting calendar date stays correct.
           const nextExec =
             computeNextExecution(
               rule.frequency,
               rule.dayOfMonth,
               rule.dayOfWeek,
-              period
+              expectedStored
             );
 
           if (!nextExec) {
             console.error(
               `Skipping recurring rule ${rule.id}: cannot advance past ` +
-                `${periodKey(period)}`
+                `${expectedStored.toISOString()}`
             );
             break;
           }
@@ -3955,7 +3969,7 @@ const processRecurringExpenses =
                 await tx.recurringRule.updateMany({
                   where: {
                     id: rule.id,
-                    nextExecution: period,
+                    nextExecution: expectedStored,
                     isActive: true,
                   },
                   data: {
@@ -3994,10 +4008,43 @@ const processRecurringExpenses =
           );
 
           if (created) {
+            expectedStored = nextExec;
             console.log(
               `✅ Auto-created ${entryType} ` +
                 `for "${rule.description}" (${periodKey(period)})`
             );
+          } else {
+            // P0-5A diagnostics: never silently treat an unmatched claim as
+            // successful processing. Distinguish an expected concurrency
+            // conflict from an unexpected timestamp mismatch, and log only
+            // identifiers and timestamps - never amounts or other financial
+            // detail.
+            const current = await prisma.recurringRule.findUnique({
+              where: { id: rule.id },
+              select: { nextExecution: true },
+            });
+            const movedOn =
+              current &&
+              current.nextExecution.getTime() !== expectedStored.getTime();
+
+            if (movedOn) {
+              console.warn(
+                `ℹ️ Recurring rule ${rule.id}: occurrence already claimed ` +
+                  `(expected ${expectedStored.toISOString()}, stored ` +
+                  `${current.nextExecution.toISOString()}).`
+              );
+            } else {
+              console.warn(
+                `⚠️ Recurring rule ${rule.id}: claim matched no row while the ` +
+                  `stored nextExecution is unchanged ` +
+                  `(expected ${expectedStored.toISOString()}) - occurrence NOT ` +
+                  `created; likely a timestamp-convention mismatch.`
+              );
+            }
+            // Stop rather than burning through the remaining catch-up periods
+            // against a claim that cannot match. The occurrence stays eligible,
+            // so a later run retries it safely.
+            break;
           }
         }
 
