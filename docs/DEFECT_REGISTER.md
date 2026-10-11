@@ -46,7 +46,11 @@ The approved design compared the token's `iat` against a new `passwordChangedAt`
 
 **PARTIAL.** Delivered and verified: `src/lib/dateRange.js` (strict month/date validation, half-open windows, timezone-stable labels) and `src/lib/csv.js` (RFC 4180 quoting, formula-injection guard, application-local dates), with 21 tests including wiring guards. The **CSV export endpoint is wired** to the safe builder.
 
-**Still unresolved:** the three backend month endpoints (`/api/dashboard/summary`, `/api/merchants/stats`, `/api/incomes`) still use their own duplicated, unvalidated month parsing and the millisecond-excluding end boundary; and the frontend still mixes three time windows on one screen (F-H1) and ignores `b.period` in budget progress (F-H2). No frontend date-window work has been done.
+**Backend: COMPLETE** (`0ba02a5`). All three month endpoints now use one window calculation with half-open `[start, end)` semantics, a 400 on invalid input, and a label taken from the validated input rather than a UTC re-derivation. `/api/dashboard/summary` and `/api/incomes` apply the window as a Prisma filter via `dateFilterFor`; `/api/merchants/stats` aggregates in memory and applies the identical window via `isWithin`, with a boundary-by-boundary test proving the two classify every instant identically. Its rolling 12-month lookback keeps its original intent but no longer drifts on 29 February.
+
+**Known gap, documented in a test rather than silently changed:** `/api/incomes` still accepts unvalidated `startDate`/`endDate` with an inclusive `lte`. It agrees with the other endpoints on the `?month=` path, and the frontend only sends `?month=`, so the gap is latent; fixing it changes an accepted input contract and needs a decision.
+
+**Frontend: NOT DONE.** Still mixes three time windows on one screen (F-H1) and ignores `b.period` in budget progress, clamping overspend at 100% (F-H2). CSV hardening (leading whitespace, control characters, separators, quoted fields) and the spreadsheet-limitation write-up are also outstanding, so P0-6 is **not** complete overall.
 
 ### Added to P0 by review decision — authentication findings
 
