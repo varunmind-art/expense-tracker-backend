@@ -40,7 +40,7 @@ The approved design compared the token's `iat` against a new `passwordChangedAt`
 
 | ID | Defect | Evidence | Status |
 |----|--------|----------|--------|
-| **P0-8** | **No category ownership validation.** `categoryId` is taken from the request body and written with only a foreign-key check, never verifying it belongs to the caller, in **seven** write paths: expenses POST/PUT, budgets POST/PUT, recurring-rules POST/PUT, pending PUT/confirm. Five of them return the referenced category via `include: { category: true }`, so an attacker can read another user's category name, icon and colour. `accountId` **is** correctly checked (`getOwnedAccount`), which is what makes the omission an inconsistency rather than a design choice. | see §V-4 below | **OPEN — elevated to P0.** Implementation, the full ownership audit (accounts, budgets, merchants, recurring rules) and the cross-tenant regression suite are **not yet done**; they need the DB-backed test environment for the positive cases |
+| **P0-8** | **No category ownership validation.** `categoryId` is taken from the request body and written with only a foreign-key check, never verifying it belongs to the caller, in **eight** write paths: expenses POST/PUT, budgets POST/PUT, recurring-rules POST/PUT, pending PUT, pending confirm. Five returned the referenced category via `include: { category: true }`, leaking another user's category name, icon and colour. `accountId` **is** correctly checked (`getOwnedAccount`), which made the omission an inconsistency rather than a design choice. | see §V-4 below | **FIXED** (`265437f`). New `src/lib/authorization.js` enforces ownership on all eight paths: a foreign id and a nonexistent id both return an identical 400 `Invalid category.` with no category object, an omitted reference stays optional, a missing tenant is refused before any query, and `findOwnedCategory` scopes the lookup by `userId`. Category **type is deliberately not restricted** (SAVINGS categories are legitimately used for budgets and recurring rules). Not DB-backed: real cross-user behaviour over HTTP needs the approved non-production environment |
 
 ### P0-6 status after the latest milestone
 
@@ -51,6 +51,28 @@ The approved design compared the token's `iat` against a new `passwordChangedAt`
 **Known gap, documented in a test rather than silently changed:** `/api/incomes` still accepts unvalidated `startDate`/`endDate` with an inclusive `lte`. It agrees with the other endpoints on the `?month=` path, and the frontend only sends `?month=`, so the gap is latent; fixing it changes an accepted input contract and needs a decision.
 
 **Frontend: NOT DONE.** Still mixes three time windows on one screen (F-H1) and ignores `b.period` in budget progress, clamping overspend at 100% (F-H2). CSV hardening (leading whitespace, control characters, separators, quoted fields) and the spreadsheet-limitation write-up are also outstanding, so P0-6 is **not** complete overall.
+
+### P0-8 authorization audit — other referenced resources
+
+| Resource | Finding | Evidence |
+|----------|---------|----------|
+| **Account** (`accountId`) | **No issue.** Every acceptance site calls `getOwnedAccount`, which scopes by `userId`. Asserted by test so a regression fails | expenses POST/PUT, incomes POST |
+| **Merchant** (`/api/merchant-list/:id`, `:id/aliases`) | **No issue.** Lookups use `findFirst` with `userId` in the WHERE clause. Asserted by test | merchant-list handlers |
+| **Budget / RecurringRule** | **No issue to fix.** They are addressed by their own id (userId-scoped) and are never referenced *from* another resource, so there is no cross-reference to authorize. Asserted by test that no `budgetId`/`recurringRuleId` foreign reference exists | — |
+| **Category on read** (`GET /api/expenses?categoryId=`) | **No issue.** Reads are `userId`-scoped first, so a foreign id yields an empty list rather than another user's rows | `app.get('/api/expenses')` |
+| **Client-supplied `userId`** | **No issue.** No endpoint reads `userId` from the body, query or params; all eight write paths use `req.user.id`. Asserted by test | whole file |
+| **Residual dependency** | The helper cannot save a query that forgets to filter. A sensitivity test demonstrates that an unscoped lookup defeats the guard, which is why `findOwnedCategory`'s WHERE clause is pinned by test | `test/p0/category-authorization.test.js` |
+
+**Read-only diagnostic prepared for later approval (NOT run, no data modified).** If ownership checks ever reject references that existing rows already contain, find them without changing anything:
+
+```sql
+-- Category references whose owner differs from the record's owner (should return 0 rows)
+SELECT e.id, e."userId" AS expense_user, c."userId" AS category_user
+FROM "Expense" e JOIN "Category" c ON c.id = e."categoryId"
+WHERE e."userId" <> c."userId";
+
+-- Repeat for Budget, RecurringRule and PendingImport.
+```
 
 ### Added to P0 by review decision — authentication findings
 
