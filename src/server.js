@@ -4017,15 +4017,22 @@ const processRecurringExpenses =
     }
   };
 
-cron.schedule(
-  '30 18 * * *',
-  processRecurringExpenses
-);
+// P0-7 integration testing: schedulers must not start when the module is merely
+// imported by a test, and a test may disable them explicitly. In normal
+// operation (node src/server.js) both guards pass and behaviour is unchanged.
+const SCHEDULERS_DISABLED = process.env.DISABLE_SCHEDULERS === 'true';
 
-setTimeout(
-  processRecurringExpenses,
-  10000
-);
+if (!SCHEDULERS_DISABLED) {
+  cron.schedule(
+    '30 18 * * *',
+    processRecurringExpenses
+  );
+
+  setTimeout(
+    processRecurringExpenses,
+    10000
+  );
+}
 
 // ==========================================
 // 12. GMAIL
@@ -4987,7 +4994,12 @@ app.get(
     })
 );
 
-app.listen(PORT, () => {
+// Only bind a port when run directly. Importing the module (integration tests)
+// must not open a listener.
+const START_SERVER = require.main === module;
+
+if (START_SERVER) {
+  app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
   );
@@ -4999,4 +5011,11 @@ app.listen(PORT, () => {
   console.log(
     'Recurring job scheduled daily at 18:30 UTC (00:00 IST).'
   );
-});
+  });
+}
+
+module.exports = {
+  app,
+  prisma,
+  processRecurringExpenses,
+};
