@@ -496,10 +496,21 @@ app.post(
           },
         });
 
+      // P0 (A-2): a uniform public response. The previous 404 for an unknown
+      // address let an attacker enumerate registered accounts, because the
+      // response differed from the 200 returned for a known one.
+      const genericResponse = {
+        message:
+          'If that email is registered, a password reset link has been sent.',
+      };
+
       if (!user) {
-        return res.status(404).json({
-          error: 'No user found with this email.',
-        });
+        // Deliberately indistinguishable from the success path, and no mail is
+        // sent; the attempt is logged server-side without PII.
+        console.warn(
+          'Password reset requested for an unknown email address.'
+        );
+        return res.json(genericResponse);
       }
 
       // P0-2: typed, short-lived, and bound to the password hash in force at
@@ -526,14 +537,19 @@ app.post(
           `This link expires in 15 minutes.</p>`,
       });
 
-      res.json({
-        message: 'Password reset email sent.',
-      });
+      res.json(genericResponse);
     } catch (error) {
-      console.error(error);
+      // A delivery failure must not distinguish a registered address from an
+      // unknown one, so the caller still receives the generic response; the
+      // failure is recorded server-side instead. No address is logged.
+      console.error(
+        'Password reset email delivery failed:',
+        error
+      );
 
-      res.status(500).json({
-        error: 'Failed to send reset email.',
+      res.json({
+        message:
+          'If that email is registered, a password reset link has been sent.',
       });
     }
   }
@@ -2571,26 +2587,19 @@ app.get(
         userId: req.user.id,
       };
 
+      // P0-6: shared validated window; invalid input is a 400.
       if (month) {
-        const [year, monthNumber] =
-          month
-            .split('-')
-            .map(Number);
+        const window = monthRange(month);
+
+        if (!window) {
+          return res.status(400).json({
+            error: 'Invalid month. Expected YYYY-MM.',
+          });
+        }
 
         where.date = {
-          gte: new Date(
-            year,
-            monthNumber - 1,
-            1
-          ),
-          lte: new Date(
-            year,
-            monthNumber,
-            0,
-            23,
-            59,
-            59
-          ),
+          gte: window.start,
+          lt: window.end,
         };
       } else {
         if (startDate) {
@@ -2751,46 +2760,17 @@ app.get(
         month,
       } = req.query;
 
-      let startDate;
-      let endDate;
+      // P0-6: one shared, validated, half-open window. An invalid month is a
+      // 400, not a 500 from an Invalid Date, and out-of-range months are
+      // rejected instead of silently rolling over.
+      const window = month
+        ? monthRange(month)
+        : monthRangeForInstant(new Date());
 
-      if (month) {
-        const [year, monthNumber] =
-          month
-            .split('-')
-            .map(Number);
-
-        startDate = new Date(
-          year,
-          monthNumber - 1,
-          1
-        );
-
-        endDate = new Date(
-          year,
-          monthNumber,
-          0,
-          23,
-          59,
-          59
-        );
-      } else {
-        const now = new Date();
-
-        startDate = new Date(
-          now.getFullYear(),
-          now.getMonth(),
-          1
-        );
-
-        endDate = new Date(
-          now.getFullYear(),
-          now.getMonth() + 1,
-          0,
-          23,
-          59,
-          59
-        );
+      if (!window) {
+        return res.status(400).json({
+          error: 'Invalid month. Expected YYYY-MM.',
+        });
       }
 
       const [
@@ -2802,8 +2782,8 @@ app.get(
           where: {
             userId: req.user.id,
             date: {
-              gte: startDate,
-              lte: endDate,
+              gte: window.start,
+              lt: window.end,
             },
           },
         }),
@@ -2813,8 +2793,8 @@ app.get(
             userId: req.user.id,
             type: 'EXPENSE',
             date: {
-              gte: startDate,
-              lte: endDate,
+              gte: window.start,
+              lt: window.end,
             },
           },
           include: {
@@ -2827,8 +2807,8 @@ app.get(
             userId: req.user.id,
             type: 'SAVINGS',
             date: {
-              gte: startDate,
-              lte: endDate,
+              gte: window.start,
+              lt: window.end,
             },
           },
           include: {
@@ -2904,9 +2884,7 @@ app.get(
 
       res.json({
         month:
-          startDate
-            .toISOString()
-            .slice(0, 7),
+          window.label,
 
         income: totalIncome,
         spent,
