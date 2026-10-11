@@ -268,14 +268,17 @@ const normaliseMerchant = (merchant) => {
 const resolveMerchantAlias = async (
   userId,
   inputName
+,
+  client
 ) => {
+  const db = client || prisma;
   const name = normaliseMerchant(inputName);
 
   if (!name) {
     return null;
   }
 
-  const match = await prisma.merchant.findFirst({
+  const match = await db.merchant.findFirst({
     where: {
       userId,
       OR: [
@@ -297,7 +300,10 @@ const resolveMerchantAlias = async (
 const upsertManagedMerchant = async (
   userId,
   merchantName
+,
+  client
 ) => {
+  const db = client || prisma;
   const name = normaliseMerchant(merchantName);
 
   if (!name) {
@@ -314,7 +320,7 @@ const upsertManagedMerchant = async (
   }
 
   try {
-    await prisma.merchant.upsert({
+    await db.merchant.upsert({
       where: {
         userId_name: {
           userId,
@@ -3843,12 +3849,15 @@ app.delete(
 // ==========================================
 
 const processRecurringExpenses =
-  async () => {
+  async (options = {}) => {
+    // P0-5C.1a: injectable Prisma client and clock so tests can run genuinely
+    // independent workers. Defaults preserve production behaviour exactly.
+    const db = options.prisma || prisma;
     console.log(
       '🔄 Running recurring job...'
     );
 
-    const today = new Date();
+    const today = options.now ? new Date(options.now) : new Date();
 
     today.setHours(
       0,
@@ -3858,7 +3867,7 @@ const processRecurringExpenses =
     );
 
     const rules =
-      await prisma.recurringRule.findMany({
+      await db.recurringRule.findMany({
         where: {
           isActive: true,
 
@@ -3917,7 +3926,8 @@ const processRecurringExpenses =
           rawMerchant
             ? await resolveMerchantAlias(
                 rule.userId,
-                rawMerchant
+                rawMerchant,
+                db
               )
             : rawMerchant;
 
@@ -3963,7 +3973,7 @@ const processRecurringExpenses =
           // failure to insert rolls the claim back rather than losing the
           // period. That makes this at-most-once (no duplicates) WITHOUT being
           // at-most-once-and-lossy.
-          const created = await prisma.$transaction(
+          const created = await db.$transaction(
             async (tx) => {
               const claim =
                 await tx.recurringRule.updateMany({
@@ -4019,7 +4029,7 @@ const processRecurringExpenses =
             // conflict from an unexpected timestamp mismatch, and log only
             // identifiers and timestamps - never amounts or other financial
             // detail.
-            const current = await prisma.recurringRule.findUnique({
+            const current = await db.recurringRule.findUnique({
               where: { id: rule.id },
               select: { nextExecution: true },
             });
@@ -4051,7 +4061,8 @@ const processRecurringExpenses =
         if (normMerchant) {
           await upsertManagedMerchant(
             rule.userId,
-            normMerchant
+            normMerchant,
+            db
           );
         }
 
