@@ -31,8 +31,15 @@ const {
   monthRange,
   monthRangeForInstant,
   appLocalDateString,
+  previousMonthLabel,
+  shiftMonths,
+  isWithin,
 } = require('./lib/dateRange');
 const { buildExpenseCsv } = require('./lib/csv');
+const {
+  planResetRequest,
+  planResetDelivery,
+} = require('./lib/auth-responses');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -496,21 +503,21 @@ app.post(
           },
         });
 
-      // P0 (A-2): a uniform public response. The previous 404 for an unknown
-      // address let an attacker enumerate registered accounts, because the
-      // response differed from the 200 returned for a known one.
-      const genericResponse = {
-        message:
-          'If that email is registered, a password reset link has been sent.',
-      };
+      // P0 (A-2): every outcome maps to one identical public response, so the
+      // response cannot reveal whether the address is registered. The decision
+      // lives in src/lib/auth-responses.js so it is executable-testable.
+      const plan = planResetRequest({
+        userExists: Boolean(user),
+      });
 
-      if (!user) {
-        // Deliberately indistinguishable from the success path, and no mail is
-        // sent; the attempt is logged server-side without PII.
+      if (!plan.shouldSendMail) {
+        // No mail is sent; the attempt is logged server-side without the
+        // address, and the public response is byte-identical to the success
+        // case.
         console.warn(
           'Password reset requested for an unknown email address.'
         );
-        return res.json(genericResponse);
+        return res.json(plan.response);
       }
 
       // P0-2: typed, short-lived, and bound to the password hash in force at
@@ -537,20 +544,21 @@ app.post(
           `This link expires in 15 minutes.</p>`,
       });
 
-      res.json(genericResponse);
+      res.json(plan.response);
     } catch (error) {
       // A delivery failure must not distinguish a registered address from an
-      // unknown one, so the caller still receives the generic response; the
-      // failure is recorded server-side instead. No address is logged.
+      // unknown one, so the requester still receives the identical generic
+      // response; only the server-side log level changes. No address is logged.
+      const outcome = planResetDelivery({
+        mailError: error,
+      });
+
       console.error(
         'Password reset email delivery failed:',
         error
       );
 
-      res.json({
-        message:
-          'If that email is registered, a password reset link has been sent.',
-      });
+      res.json(outcome.response);
     }
   }
 );
@@ -1097,85 +1105,29 @@ app.get(
         month,
       } = req.query;
 
-      let startDate;
-      let endDate;
-      let prevStartDate;
-      let prevEndDate;
+      // P0-6A: one shared, validated, half-open window for the selected month
+      // and for the previous month. Both the database query below and the
+      // in-memory filters derive from these objects, so they cannot disagree.
+      const window = month
+        ? monthRange(month)
+        : monthRangeForInstant(new Date());
 
-      if (month) {
-        const [year, monthNumber] =
-          month
-            .split('-')
-            .map(Number);
-
-        startDate = new Date(
-          year,
-          monthNumber - 1,
-          1
-        );
-
-        endDate = new Date(
-          year,
-          monthNumber,
-          0,
-          23,
-          59,
-          59
-        );
-
-        prevStartDate = new Date(
-          year,
-          monthNumber - 2,
-          1
-        );
-
-        prevEndDate = new Date(
-          year,
-          monthNumber - 1,
-          0,
-          23,
-          59,
-          59
-        );
-      } else {
-        const now = new Date();
-
-        startDate = new Date(
-          now.getFullYear(),
-          now.getMonth(),
-          1
-        );
-
-        endDate = new Date(
-          now.getFullYear(),
-          now.getMonth() + 1,
-          0,
-          23,
-          59,
-          59
-        );
-
-        prevStartDate = new Date(
-          now.getFullYear(),
-          now.getMonth() - 1,
-          1
-        );
-
-        prevEndDate = new Date(
-          now.getFullYear(),
-          now.getMonth(),
-          0,
-          23,
-          59,
-          59
-        );
+      if (!window) {
+        return res.status(400).json({
+          error: 'Invalid month. Expected YYYY-MM.',
+        });
       }
 
-      const twelveMonthsAgo =
-        new Date();
+      const prevWindow = monthRange(
+        previousMonthLabel(window.label)
+      );
 
-      twelveMonthsAgo.setMonth(
-        twelveMonthsAgo.getMonth() - 12
+      // Business logic preserved: the all-time figures remain a rolling
+      // 12-month lookback from now. Only the arithmetic is hardened, because
+      // setMonth(getMonth() - 12) on 29 February drifts to 1 March.
+      const twelveMonthCutoff = shiftMonths(
+        new Date(),
+        -12
       );
 
       const allRecent =
@@ -1187,7 +1139,7 @@ app.get(
               not: null,
             },
             date: {
-              gte: twelveMonthsAgo,
+              gte: twelveMonthCutoff,
             },
           },
           include: {
@@ -1303,21 +1255,14 @@ app.get(
           categoryName
         ] = categoryIcon;
 
-        if (
-          expense.date >= startDate &&
-          expense.date <= endDate
-        ) {
+        if (isWithin(window, expense.date)) {
           merchant.monthSpent +=
             amount;
 
           merchant.monthCount += 1;
         }
 
-        if (
-          expense.date >=
-            prevStartDate &&
-          expense.date <= prevEndDate
-        ) {
+        if (isWithin(prevWindow, expense.date)) {
           merchant.prevMonthSpent +=
             amount;
 
@@ -1468,10 +1413,7 @@ app.get(
           );
 
       res.json({
-        month:
-          startDate
-            .toISOString()
-            .slice(0, 7),
+        month: window.label,
         merchants,
       });
     } catch (error) {

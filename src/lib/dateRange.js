@@ -132,6 +132,63 @@ const customRange = (fromDate, toDate, offsetMinutes = APP_UTC_OFFSET_MINUTES) =
   return { start, end, label: `${fromDate}..${toDate}` };
 };
 
+/**
+ * The "YYYY-MM" label immediately before `label` (handles the January rollover).
+ * @returns {string|null} null when the input is not a valid month
+ */
+const previousMonthLabel = (label) => {
+  const parsed = parseMonth(label);
+  if (!parsed) return null;
+  const { year, monthIndex } = parsed;
+  return monthIndex === 0
+    ? `${year - 1}-12`
+    : `${year}-${pad(monthIndex)}`;
+};
+
+/**
+ * Shift an instant by whole months in application-local time, clamping the day
+ * to the target month's length.
+ *
+ * The naive equivalent used by the merchant lookback (`setMonth(getMonth() - 12)`)
+ * drifts: run on 29 February it lands on 1 March, silently widening the window.
+ */
+const shiftMonths = (instant, months, offsetMinutes = APP_UTC_OFFSET_MINUTES) => {
+  const local = toAppLocal(new Date(instant), offsetMinutes);
+  const year = local.getUTCFullYear();
+  const monthIndex = local.getUTCMonth();
+  const day = local.getUTCDate();
+
+  const targetMonth = new Date(Date.UTC(year, monthIndex + months, 1));
+  const targetYear = targetMonth.getUTCFullYear();
+  const targetMonthIndex = targetMonth.getUTCMonth();
+  const lastDay = daysInMonth(targetYear, targetMonthIndex);
+
+  return fromAppLocal(
+    targetYear,
+    targetMonthIndex,
+    Math.min(day, lastDay),
+    offsetMinutes
+  );
+};
+
+/**
+ * The Prisma `date` filter for a window: half-open, start inclusive, end
+ * exclusive.
+ *
+ * Both the database query AND the in-memory filter must be built from this, so
+ * they cannot disagree about a boundary instant.
+ */
+const dateFilterFor = (window) => ({
+  gte: window.start,
+  lt: window.end,
+});
+
+/** In-memory equivalent of `dateFilterFor`. Same half-open semantics. */
+const isWithin = (window, instant) => {
+  const time = new Date(instant).getTime();
+  return time >= window.start.getTime() && time < window.end.getTime();
+};
+
 module.exports = {
   APP_UTC_OFFSET_MINUTES,
   parseMonth,
@@ -143,4 +200,8 @@ module.exports = {
   monthRangeForInstant,
   weekRange,
   customRange,
+  previousMonthLabel,
+  shiftMonths,
+  dateFilterFor,
+  isWithin,
 };
