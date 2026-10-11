@@ -3,16 +3,28 @@
 /**
  * P0-5 — recurring schedule arithmetic (single source of truth).
  *
- * Before this module the same calculation existed twice: `computeNextExecution`
- * in src/server.js and an inline copy inside the recurring cron. They disagreed
- * (the cron's WEEKLY branch ignored `dayOfWeek` entirely, and its YEARLY branch
- * ignored the day fields), and the MONTHLY branch called setMonth() before
- * setDate(), so an overflowing day was normalised first and the target month was
- * lost.
+ * P0-5B: all scheduling now uses ONE explicit, documented application timezone
+ * instead of the host machine's local timezone.
  *
- * Every function here takes an explicit `from` date. Nothing reads the clock
- * implicitly, which is what makes the tests deterministic and what lets the cron
- * advance from a rule's own `nextExecution` instead of from "today".
+ * The defect this removes: the previous implementation used `setHours(0,0,0,0)`,
+ * `getDate()`, `setDate()` and `setMonth()` — all host-local operations. The same
+ * rule could therefore resolve to a different calendar date depending on the
+ * server's TZ (for example a developer machine in Asia/Kolkata versus Render in
+ * UTC), and a DST-transition zone could shift a date by an hour and change the
+ * civil day. The P0-5A claim fix stopped that from causing a *missed*
+ * occurrence, but the computed dates themselves were still deployment-dependent.
+ *
+ * The policy: schedule in **Asia/Kolkata (UTC+05:30)**, a fixed offset with no
+ * daylight saving, matching the application's existing date policy in
+ * `src/lib/dateRange.js` (APP_UTC_OFFSET_MINUTES = 330). Civil-date arithmetic is
+ * performed in UTC space and converted back to the corresponding instant, so no
+ * host-local getter or setter is used anywhere in this module. A full IANA
+ * library would be needed to support a zone with DST; that is deliberately not
+ * introduced here, and the fixed offset is documented rather than implied.
+ *
+ * Database concurrency control stays separate: `listDuePeriods` returns business
+ * calendar dates, while the caller claims on the exact stored `nextExecution`
+ * value (P0-5A).
  */
 
 /** Supported recurrence frequencies. Any other value is invalid, not a default. */
@@ -21,20 +33,45 @@ const FREQUENCIES = Object.freeze(['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY']);
 /**
  * Upper bound on how many missed periods a single run will materialise.
  * Documented catch-up policy: see docs/P0-5_SCHEDULE_CHANGE_REPORT.md.
- * Change this one constant to switch the policy.
  */
 const MAX_CATCH_UP_PERIODS = 12;
 
+/** The application scheduling timezone: IST (UTC+05:30), fixed, no DST. */
+const APP_UTC_OFFSET_MINUTES = 330;
+
 const isSupportedFrequency = (frequency) => FREQUENCIES.includes(frequency);
 
-/** Days in a month, 1-indexed month via a Date-style month index. */
-const daysInMonth = (year, monthIndex) => new Date(year, monthIndex + 1, 0).getDate();
+const isUsableDate = (value) =>
+  value instanceof Date && !Number.isNaN(value.getTime());
 
-const startOfDay = (value) => {
-  const copy = new Date(value);
-  copy.setHours(0, 0, 0, 0);
-  return copy;
+/** Days in a month, using a Date-style month index. Pure UTC, no local getters. */
+const daysInMonth = (year, monthIndex) =>
+  new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+
+/**
+ * The application-local civil date of an instant, as plain numbers.
+ * Shifting by the offset and reading UTC parts is equivalent to reading local
+ * parts in that zone, and is independent of the host timezone.
+ */
+const toCivil = (instant) => {
+  const shifted = new Date(instant.getTime() + APP_UTC_OFFSET_MINUTES * 60000);
+  return {
+    year: shifted.getUTCFullYear(),
+    monthIndex: shifted.getUTCMonth(),
+    day: shifted.getUTCDate(),
+  };
 };
+
+/**
+ * The instant at application-local midnight for a civil date.
+ * This is the inverse of `toCivil` for midnight values.
+ */
+const fromCivil = (year, monthIndex, day) =>
+  new Date(Date.UTC(year, monthIndex, day) - APP_UTC_OFFSET_MINUTES * 60000);
+
+/** Weekday (0 = Sunday) of a civil date. Pure UTC arithmetic. */
+const weekdayOf = (year, monthIndex, day) =>
+  new Date(Date.UTC(year, monthIndex, day)).getUTCDay();
 
 /** @returns {number|null} a valid 1..31 day, or null when absent/out of range. */
 const normaliseDayOfMonth = (value) => {
@@ -55,91 +92,105 @@ const normaliseDayOfWeek = (value) => {
 };
 
 /**
- * The next execution strictly after `from`.
+ * The next execution strictly after `from`, at application-local midnight.
  *
  * @param {string} frequency one of FREQUENCIES
  * @param {number|string|null} dayOfMonth
  * @param {number|string|null} dayOfWeek
- * @param {Date} from  the instant to advance from (a rule's own nextExecution)
+ * @param {Date} from the instant to advance from (a rule's own nextExecution)
  * @returns {Date|null} null when the frequency is unsupported or the input date
- *   is invalid. Callers MUST treat null as a rejection, never as "now" — the old
- *   code returned the input unchanged, which made the cron re-fire forever.
+ *   is invalid. Callers MUST treat null as a rejection, never as "now".
  */
 const computeNextExecution = (frequency, dayOfMonth, dayOfWeek, from) => {
   if (!isSupportedFrequency(frequency)) {
     return null;
   }
 
-  const base = startOfDay(from === undefined ? new Date() : from);
-  if (Number.isNaN(base.getTime())) {
+  const base = from === undefined ? new Date() : new Date(from);
+  if (!isUsableDate(base)) {
     return null;
   }
 
+  const { year, monthIndex, day } = toCivil(base);
+
   if (frequency === 'DAILY') {
-    const next = new Date(base);
-    next.setDate(base.getDate() + 1);
-    return next;
+    return fromCivil(year, monthIndex, day + 1);
   }
 
   if (frequency === 'WEEKLY') {
-    // `dayOfWeek` is honoured here; the old cron branch ignored it and always
-    // advanced by exactly 7 days from the run date.
+    // Always strictly in the future: landing on the configured weekday counts as
+    // a full week ahead rather than "today".
     const target = normaliseDayOfWeek(dayOfWeek);
-    const weekday = target === null ? base.getDay() : target;
-    const delta = (weekday - base.getDay() + 7) % 7;
-    const next = new Date(base);
-    next.setDate(base.getDate() + (delta === 0 ? 7 : delta));
-    return next;
+    const weekday = target === null ? weekdayOf(year, monthIndex, day) : target;
+    const delta = (weekday - weekdayOf(year, monthIndex, day) + 7) % 7;
+    return fromCivil(year, monthIndex, day + (delta === 0 ? 7 : delta));
   }
 
   if (frequency === 'MONTHLY') {
     const requested = normaliseDayOfMonth(dayOfMonth);
-    const targetDay = requested === null ? base.getDate() : requested;
+    const targetDay = requested === null ? day : requested;
 
-    // Resolve the TARGET MONTH first, then clamp the day inside it. Doing this
-    // in the other order is the original bug: setMonth() normalises an
-    // overflowing day (Jan 31 -> "Feb 31" -> Mar 3) before setDate() runs, so
-    // the clamp lands in the wrong month and a whole period is skipped.
-    const firstOfTarget = new Date(base.getFullYear(), base.getMonth() + 1, 1);
-    const lastDay = daysInMonth(firstOfTarget.getFullYear(), firstOfTarget.getMonth());
-    return new Date(firstOfTarget.getFullYear(), firstOfTarget.getMonth(), Math.min(targetDay, lastDay));
+    // Resolve the TARGET month first, then clamp the day inside it. Doing this in
+    // the other order is the original month-skip bug.
+    const target = new Date(Date.UTC(year, monthIndex + 1, 1));
+    const targetYear = target.getUTCFullYear();
+    const targetMonth = target.getUTCMonth();
+    const lastDay = daysInMonth(targetYear, targetMonth);
+    return fromCivil(targetYear, targetMonth, Math.min(targetDay, lastDay));
   }
 
   // YEARLY — clamp for 29 February.
-  const targetMonth = base.getMonth();
-  const year = base.getFullYear() + 1;
-  const lastDay = daysInMonth(year, targetMonth);
-  return new Date(year, targetMonth, Math.min(base.getDate(), lastDay));
+  const targetYear = year + 1;
+  const lastDay = daysInMonth(targetYear, monthIndex);
+  return fromCivil(targetYear, monthIndex, Math.min(day, lastDay));
 };
 
 /**
  * Every period that has come due for a rule, oldest first, capped.
  *
- * Catch-up policy: materialise each missed period individually, up to
- * MAX_CATCH_UP_PERIODS, and report `hasMore` so the caller can flag a rule that
- * is further behind than the cap rather than silently skipping it.
+ * `today` is compared as an application-local civil date, so the result does not
+ * depend on the host timezone.
  *
  * @returns {{ periods: Date[], hasMore: boolean, invalid: boolean }}
  */
 const listDuePeriods = (frequency, dayOfMonth, dayOfWeek, nextExecution, today, maxPeriods) => {
   const cap = Number.isInteger(maxPeriods) && maxPeriods > 0 ? maxPeriods : MAX_CATCH_UP_PERIODS;
-  const limit = startOfDay(today === undefined ? new Date() : today);
   const periods = [];
 
   if (!isSupportedFrequency(frequency)) {
     return { periods, hasMore: false, invalid: true };
   }
 
-  let cursor = startOfDay(nextExecution);
-  if (Number.isNaN(cursor.getTime())) {
+  const start = new Date(nextExecution);
+  if (!isUsableDate(start)) {
     return { periods, hasMore: false, invalid: true };
   }
 
-  while (cursor <= limit) {
+  const limitInstant = today === undefined ? new Date() : new Date(today);
+  if (!isUsableDate(limitInstant)) {
+    return { periods, hasMore: false, invalid: true };
+  }
+
+  const startCivil = toCivil(start);
+  const limitCivil = toCivil(limitInstant);
+  const limitKey =
+    limitCivil.year * 10000 + (limitCivil.monthIndex + 1) * 100 + limitCivil.day;
+
+  let cursor = fromCivil(startCivil.year, startCivil.monthIndex, startCivil.day);
+
+  for (;;) {
+    const civil = toCivil(cursor);
+    const cursorKey = civil.year * 10000 + (civil.monthIndex + 1) * 100 + civil.day;
+    if (cursorKey > limitKey) {
+      return { periods, hasMore: false, invalid: false };
+    }
+
     if (periods.length >= cap) {
       return { periods, hasMore: true, invalid: false };
     }
+
     periods.push(new Date(cursor));
+
     const next = computeNextExecution(frequency, dayOfMonth, dayOfWeek, cursor);
     // Defensive: never loop forever on a rule that cannot advance.
     if (!next || next <= cursor) {
@@ -147,23 +198,26 @@ const listDuePeriods = (frequency, dayOfMonth, dayOfWeek, nextExecution, today, 
     }
     cursor = next;
   }
-
-  return { periods, hasMore: false, invalid: false };
 };
 
 /**
- * Stable idempotency key for one expected occurrence ("2026-02-28").
- * Used by the prepared unique-constraint design documented in
- * docs/P0-5_SCHEDULE_CHANGE_REPORT.md; not yet persisted.
+ * Stable idempotency key for one expected occurrence ("2026-02-28"), in the
+ * application timezone so the same occurrence always yields the same key.
  */
-const periodKey = (date) =>
-  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+const periodKey = (date) => {
+  const civil = toCivil(new Date(date));
+  return `${civil.year}-${String(civil.monthIndex + 1).padStart(2, '0')}-${String(civil.day).padStart(2, '0')}`;
+};
 
 module.exports = {
   FREQUENCIES,
   MAX_CATCH_UP_PERIODS,
+  APP_UTC_OFFSET_MINUTES,
   isSupportedFrequency,
   daysInMonth,
+  toCivil,
+  fromCivil,
+  weekdayOf,
   normaliseDayOfMonth,
   normaliseDayOfWeek,
   computeNextExecution,
