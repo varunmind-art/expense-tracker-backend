@@ -134,6 +134,117 @@ const asDate = (value) => {
   return Number.isNaN(d.getTime()) ? null : d;
 };
 
+/** Midnight of the given date, for day-granularity comparisons. */
+const startOfDay = (value) => {
+  const d = asDate(value);
+  return d ? new Date(d.getFullYear(), d.getMonth(), d.getDate()) : null;
+};
+
+/** The `day`-th of the month containing `anchor`, clamped to that month's length. */
+const dueDateInMonth = (anchor, day) => {
+  const a = asDate(anchor);
+  if (!a) return null;
+  const lastDay = new Date(a.getFullYear(), a.getMonth() + 1, 0).getDate();
+  const useDay = Number.isInteger(Number(day)) && Number(day) >= 1
+    ? Math.min(Number(day), lastDay)
+    : a.getDate();
+  return new Date(a.getFullYear(), a.getMonth(), useDay);
+};
+
+/**
+ * THE repayment timeline — the single anchor for every loan date.
+ *
+ * Before this existed, three different conventions were in play at once:
+ * `nextEmiDate` came from today's date, the dashboard payoff came from
+ * `today + remaining months` (using today's day-of-month), and the amortization
+ * table came from `startDate + period months` (using the disbursement
+ * day-of-month). A real production loan (Rs 55,00,000 @ 7.5%, disbursed
+ * 1 Apr 2026, EMI day 5, 179 instalments ending Mar 2041) therefore showed a
+ * dashboard payoff of 12 Sep 2041 while its own schedule ended in March 2041.
+ *
+ * Conventions, all contractually standard:
+ *   - the FIRST instalment falls in the month AFTER disbursement;
+ *   - the instalment day is `emiDay` when set, otherwise the disbursement day,
+ *     clamped to the length of each month;
+ *   - `endDate` is the MATURITY date, so the number of instalments is the
+ *     inclusive count of due dates from the first due date through it;
+ *   - an explicitly supplied `installments` count wins over everything else, so
+ *     a term a user typed in is never silently re-derived.
+ *
+ * @returns {{dueDay:number|null, firstDueDate:Date|null, installments:number|null,
+ *            termSource:string|null, finalDueDate:Date|null,
+ *            startDate:Date|null, endDate:Date|null}}
+ */
+const repaymentTimeline = ({
+  startDate = null,
+  endDate = null,
+  emiDay = null,
+  installments = null,
+  emiAmount = 0,
+  interestRate = 0,
+  originalPrincipal = 0,
+} = {}) => {
+  const start = asDate(startDate);
+  const end = asDate(endDate);
+
+  const explicitDay = Number(emiDay);
+  const dueDay = Number.isInteger(explicitDay) && explicitDay >= 1 && explicitDay <= 31
+    ? explicitDay
+    : (start ? start.getDate() : null);
+
+  const firstDueDate = start ? dueDateInMonth(addMonthsClamped(start, 1), dueDay) : null;
+
+  let term = null;
+  let termSource = null;
+
+  const explicitTerm = Number(installments);
+  if (Number.isInteger(explicitTerm) && explicitTerm > 0) {
+    term = explicitTerm;
+    termSource = 'explicit';
+  } else if (firstDueDate && end) {
+    term = Math.max(1, monthsBetween(firstDueDate, end) + 1);
+    termSource = 'endDate';
+  } else if (num(emiAmount) > 0) {
+    const fromEmi = remainingTenure(originalPrincipal, interestRate, emiAmount);
+    if (fromEmi && fromEmi > 0) {
+      term = fromEmi;
+      termSource = 'emi';
+    }
+  } else if (start && end) {
+    term = Math.max(1, monthsBetween(start, end));
+    termSource = 'startToEnd';
+  }
+
+  const finalDueDate = firstDueDate && term ? addMonthsClamped(firstDueDate, term - 1) : null;
+
+  return { dueDay, firstDueDate, installments: term, termSource, finalDueDate, startDate: start, endDate: end };
+};
+
+/**
+ * How many contractual instalments the ledger has settled.
+ *
+ * A regular EMI — one that carries an interest component — settles exactly one
+ * instalment. A prepayment or a principal-only adjustment does NOT: it reduces
+ * the balance and shortens the loan, but the monthly instalments remain due.
+ *
+ * This distinction matters. Mapping cumulative principal repaid onto the
+ * schedule instead makes a single large prepayment appear to settle every
+ * instalment whose principal it covers, which wrongly pushes the next due date
+ * years into the future for EMIs that were never paid.
+ *
+ * Known simplification: an interest-bearing payment counts as settling one
+ * instalment even if it fell short of the full EMI. Per-period PAID/PARTIAL
+ * detail is reported by the schedule annotation.
+ */
+const settledInstallmentCount = (payments = [], term = null) => {
+  let count = 0;
+  for (const payment of payments || []) {
+    if (!payment) continue;
+    if (toPaise(payment.interestAmount) > 0) count += 1;
+  }
+  return Number.isInteger(term) && term > 0 ? Math.min(term, count) : count;
+};
+
 // ---------------------------------------------------------------------------
 // 1. EMI
 // ---------------------------------------------------------------------------
@@ -286,6 +397,7 @@ const buildAmortizationSchedule = ({
   extraPrincipal = 0,
   extraPrincipalByPeriod = null,
   periods = null,
+  firstDueDate = null,
   maxPeriods = MAX_PERIODS,
 } = {}) => {
   const principalPaise = Math.max(0, toPaise(principal));
@@ -295,6 +407,10 @@ const buildAmortizationSchedule = ({
     Number.isInteger(periods) && periods > 0 ? periods : null;
   const r = monthlyRate(annualRatePercent);
   const start = asDate(startDate);
+  // When the caller supplies the contractual first due date, every row is dated
+  // from it (period 1 = the first instalment). Otherwise the legacy
+  // `startDate + period months` dating is kept for direct callers.
+  const dueAnchor = asDate(firstDueDate);
 
   const rows = [];
   let balance = principalPaise;
@@ -356,7 +472,11 @@ const buildAmortizationSchedule = ({
 
     rows.push({
       period,
-      date: start ? addMonthsClamped(start, period) : null,
+      date: dueAnchor
+        ? addMonthsClamped(dueAnchor, period - 1)
+        : start
+          ? addMonthsClamped(start, period)
+          : null,
       openingBalance: fromPaise(opening),
       interest: fromPaise(interestPaise),
       principal: fromPaise(principalPart),
@@ -612,6 +732,9 @@ const prepaymentSavings = ({
   // endDate) the baseline closes in exactly that many periods, which keeps the
   // simulator's "current payoff date" identical to the summary endpoint's.
   periods = null,
+  // The contractual due date of the first remaining instalment. Supplying it
+  // makes the baseline's final date identical to the dashboard's payoff date.
+  firstDueDate = null,
 } = {}) => {
   const rate = num(annualRatePercent);
   const balance =
@@ -621,6 +744,10 @@ const prepaymentSavings = ({
   const extra = Math.max(0, num(extraAmount));
   const recurring = Math.max(0, num(monthlyExtra));
   const start = asDate(fromDate) || asDate(startDate);
+  const anchor = asDate(firstDueDate);
+  // Only applied when the caller supplies it, so direct callers keep the legacy
+  // `start + period months` dating.
+  const anchorOption = anchor ? { firstDueDate: anchor } : {};
 
   const baseline = buildAmortizationSchedule({
     principal: balance,
@@ -628,6 +755,7 @@ const prepaymentSavings = ({
     emi,
     startDate: start,
     periods,
+    ...anchorOption,
   });
 
   if (extra <= 0 && recurring <= 0) {
@@ -672,6 +800,7 @@ const prepaymentSavings = ({
     emi: scenarioEmi,
     startDate: start,
     extraPrincipal: recurring,
+    ...anchorOption,
   });
 
   const scenarioPayoff = lastScheduleDate(scenario) || start;
@@ -822,11 +951,56 @@ const summarizeLoan = (loan = {}, payments = [], { asOf = null } = {}) => {
     totalPaid += Math.max(0, toPaise(p.totalAmount));
   }
 
-  const monthsLeft = emi > 0 ? remainingTenure(outstanding, rate, emi) : null;
-  const payoff = emi > 0 ? payoffDate(outstanding, rate, emi, asDate(asOf) || new Date()) : null;
+  const timeline = repaymentTimeline({
+    startDate: loan.startDate,
+    endDate: loan.endDate,
+    emiDay: loan.emiDay,
+    installments: loan.installments,
+    emiAmount: emi,
+    interestRate: rate,
+    originalPrincipal: original,
+  });
 
-  const progressPercent =
-    original > 0 ? roundHalfUp((repaid / original) * 100, 2) : 0;
+  // The contractual lifetime table. Every date reported below is read off this
+  // one table, so the dashboard, the schedule endpoint and the simulator cannot
+  // disagree with each other or with the amortization the user can see.
+  const lifetime = buildAmortizationSchedule({
+    principal: original,
+    annualRatePercent: rate,
+    emi,
+    startDate: loan.startDate,
+    firstDueDate: timeline.firstDueDate,
+    periods: timeline.installments,
+  });
+
+  // A settled instalment advances the pointer; a prepayment does not.
+  const settled = settledInstallmentCount(sorted, lifetime.rows.length);
+  const nextIndex = settled >= lifetime.rows.length ? null : settled;
+  const nextDueRow = nextIndex === null ? null : lifetime.rows[nextIndex];
+  const nextDueDate = nextDueRow ? nextDueRow.date : null;
+
+  const monthsLeft =
+    outstanding > 0
+      ? (emi > 0 ? remainingTenure(outstanding, rate, emi) : null)
+      : 0;
+
+  // The payoff is the LAST remaining instalment on the loan's own timeline.
+  // "Today + remaining months" was wrong: it ignored the contractual due dates
+  // and took the day-of-month from the wall clock.
+  const payoff = outstanding <= 0
+    ? (sorted.length ? sorted[sorted.length - 1].date : null)
+    : nextDueDate && Number.isFinite(monthsLeft) && monthsLeft > 0
+      ? addMonthsClamped(nextDueDate, monthsLeft - 1)
+      : null;
+
+  const asOfDay = startOfDay(asOf) || startOfDay(new Date());
+  const overdueInstallments = lifetime.rows.reduce((count, row, index) => {
+    if (nextIndex !== null && index < nextIndex) return count;
+    if (!row.date) return count;
+    return startOfDay(row.date).getTime() < asOfDay.getTime() ? count + 1 : count;
+  }, 0);
+
+  const progressPercent = original > 0 ? roundHalfUp((repaid / original) * 100, 2) : 0;
 
   return {
     id: loan.id ?? null,
@@ -843,12 +1017,27 @@ const summarizeLoan = (loan = {}, payments = [], { asOf = null } = {}) => {
     interestRate: rate,
     emiAmount: emi,
     paymentAccountId: loan.paymentAccountId ?? null,
+
+    // ---- the one repayment timeline ----
     startDate: loan.startDate ?? null,
     emiDay: loan.emiDay ?? null,
+    dueDay: timeline.dueDay,
+    firstDueDate: timeline.firstDueDate,
+    installments: timeline.installments,
+    termSource: timeline.termSource,
+    finalScheduledDate: timeline.finalDueDate,
     storedEndDate: loan.endDate ?? null,
+
+    // ---- where the borrower actually is on it ----
+    nextDueDate,
+    settledInstallments: settled,
+    overdueInstallments,
+    remainingInstallments: nextIndex === null ? 0 : lifetime.rows.length - nextIndex,
+    balanceAsOfDate: sorted.length ? sorted[sorted.length - 1].date : null,
+
     paymentCount: sorted.length,
     lastPaymentDate: sorted.length ? sorted[sorted.length - 1].date : null,
-    remainingMonths: monthsLeft,
+    remainingMonths: Number.isFinite(monthsLeft) ? monthsLeft : null,
     estimatedPayoffDate: payoff,
     isClosed: outstanding <= 0,
   };
@@ -991,6 +1180,18 @@ const validateLoanInput = (body = {}, { requireAll = true } = {}) => {
     value.isActive = Boolean(body.isActive);
   }
 
+  // An explicit instalment count is accepted as an input convenience and is
+  // mapped onto an end date by the routes. It is NOT a stored column, so it is
+  // always stripped before a Prisma write.
+  if (has('installments')) {
+    const count = Number(body.installments);
+    if (!Number.isInteger(count) || count < 1 || count > MAX_PERIODS) {
+      errors.push(`Installments must be a whole number between 1 and ${MAX_PERIODS}.`);
+    } else {
+      value.installments = count;
+    }
+  }
+
   return { ok: errors.length === 0, errors, value };
 };
 
@@ -1003,9 +1204,18 @@ const deriveEmiIfMissing = (loan = {}) => {
   if (loan.emiAmount !== null && loan.emiAmount !== undefined && num(loan.emiAmount) > 0) {
     return num(loan.emiAmount);
   }
-  const start = asDate(loan.startDate);
-  const end = asDate(loan.endDate);
-  const months = start && end ? monthsBetween(start, end) : 0;
+  // The instalment must be derived over the SAME number of instalments the
+  // schedule will use, otherwise the table cannot close on the stated term.
+  const timeline = repaymentTimeline({
+    startDate: loan.startDate,
+    endDate: loan.endDate,
+    emiDay: loan.emiDay,
+    installments: loan.installments,
+    emiAmount: 0,
+    interestRate: loan.interestRate ?? 0,
+    originalPrincipal: loan.originalPrincipal,
+  });
+  const months = timeline.installments || 0;
   if (months > 0) {
     // roundUp: a derived EMI must actually clear the stated tenure, otherwise a
     // few paise per month accumulate into an extra period.
@@ -1033,6 +1243,10 @@ module.exports = {
   // calendar
   addMonthsClamped,
   monthsBetween,
+  startOfDay,
+  dueDateInMonth,
+  repaymentTimeline,
+  settledInstallmentCount,
   // engine
   emiFor,
   splitEmi,

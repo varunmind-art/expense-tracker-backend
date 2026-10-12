@@ -37,6 +37,11 @@ const {
   clampToZero,
   monthlyRate,
   addMonthsClamped,
+  monthsBetween,
+  startOfDay,
+  dueDateInMonth,
+  repaymentTimeline,
+  settledInstallmentCount,
 } = require('../../src/lib/loans');
 
 const START = new Date(2026, 0, 1); // 1 Jan 2026, local calendar
@@ -875,6 +880,9 @@ test('summary: reports outstanding, progress and payoff from one source', () => 
     currentPrincipal: 1000000,
     interestRate: 8.5,
     emiAmount: 8678.23,
+    // A contractual timeline is what makes a payoff date knowable at all.
+    startDate: new Date(2026, 0, 1),
+    emiDay: 5,
   };
   const payments = [
     { id: 'a', date: new Date(2026, 1, 1), principalAmount: 1594.9, extraPrincipal: 0, totalAmount: 8678.23, interestAmount: 7083.33 },
@@ -892,6 +900,23 @@ test('summary: reports outstanding, progress and payoff from one source', () => 
   assert.equal(summary.isClosed, false);
   assert.ok(summary.remainingMonths > 0);
   assert.ok(summary.estimatedPayoffDate instanceof Date);
+  // Anchored on the loan's own due dates, never on the wall clock.
+  assert.equal(summary.firstDueDate.getDate(), 5);
+  assert.equal(summary.firstDueDate.getMonth(), 1); // February
+  assert.equal(summary.nextDueDate.getDate(), 5);
+});
+
+test('summary: a loan with no dates reports no payoff rather than inventing one', () => {
+  const summary = summarizeLoan(
+    { originalPrincipal: 1000000, currentPrincipal: 1000000, interestRate: 8.5, emiAmount: 8678.23 },
+    []
+  );
+  // There is no contractual timeline, so there is no honest payoff date. The
+  // old code returned "today + months", which is what produced a dashboard
+  // payoff three days away from the loan's real final instalment.
+  assert.equal(summary.estimatedPayoffDate, null);
+  assert.equal(summary.nextDueDate, null);
+  assert.ok(summary.remainingMonths > 0);
 });
 
 test('summary: a fully repaid loan is closed and owes nothing', () => {
@@ -1169,3 +1194,401 @@ test('end to end: replaying every payment reaches a zero balance exactly', () =>
   assert.equal(interestPaid, rupees(schedule.totalInterest));
 });
 
+
+// ---------------------------------------------------------------------------
+// One repayment timeline (production defect: Motiaz Blue Ridge loan)
+// ---------------------------------------------------------------------------
+//
+// Reported from production, with zero payments recorded:
+//   principal Rs 55,00,000 | 7.50% | EMI Rs 51,140.13
+//   disbursed 1 Apr 2026 | maturity 30 Mar 2041 | 179 instalments from May 2026
+//   dashboard said: next EMI 5 Nov 2026 and payoff 12 Sep 2041
+//
+// Both dashboard dates were invented from the wall clock. The loan's own
+// amortization ends in March 2041, and its first unpaid instalment is May 2026.
+
+const MOTIAZ = {
+  originalPrincipal: 5500000,
+  currentPrincipal: 5500000,
+  interestRate: 7.5,
+  emiAmount: 51140.13,
+  startDate: new Date(2026, 3, 1), // 1 Apr 2026
+  endDate: new Date(2041, 2, 30), // 30 Mar 2041
+  emiDay: 5,
+};
+
+/** Independent month count between two dates, inclusive, by literal stepping. */
+const countMonthsInclusive = (from, to) => {
+  let n = 0;
+  const cursor = new Date(from.getTime());
+  while (cursor.getTime() <= to.getTime() && n < 2000) {
+    n += 1;
+    cursor.setMonth(cursor.getMonth() + 1);
+  }
+  return n;
+};
+
+/** Independent closed-form EMI (the forward form, deliberately not the engine's). */
+const emiClosedForm = (principal, annualPercent, months) => {
+  const r = annualPercent / 12 / 100;
+  if (r === 0) return principal / months;
+  const factor = Math.pow(1 + r, months);
+  return (principal * r * factor) / (factor - 1);
+};
+
+test('Motiaz: the saved term is 179 instalments, confirmed independently', () => {
+  const timeline = repaymentTimeline({
+    startDate: MOTIAZ.startDate,
+    endDate: MOTIAZ.endDate,
+    emiDay: MOTIAZ.emiDay,
+  });
+
+  assert.equal(timeline.firstDueDate.getFullYear(), 2026);
+  assert.equal(timeline.firstDueDate.getMonth(), 4); // May
+  assert.equal(timeline.firstDueDate.getDate(), 5);
+
+  // Independent count: 5 May 2026 through 30 Mar 2041, month by month.
+  const independent = countMonthsInclusive(timeline.firstDueDate, MOTIAZ.endDate);
+  assert.equal(independent, 179);
+  assert.equal(timeline.installments, independent);
+  assert.equal(timeline.installments, 179);
+});
+
+test('Motiaz: the stored EMI belongs to 179 months, not 180', () => {
+  // Cross-checked against an independent closed-form EMI.
+  assert.ok(Math.abs(emiClosedForm(5500000, 7.5, 179) - 51140.13) < 0.02);
+  assert.ok(Math.abs(emiClosedForm(5500000, 7.5, 180) - 50985.68) < 0.02);
+
+  assert.equal(emiFor(5500000, 7.5, 179), 51140.13);
+  assert.equal(emiFor(5500000, 7.5, 180), 50985.68);
+  // The loan carries the 179-month instalment, so its term is 179.
+  assert.equal(
+    repaymentTimeline({
+      startDate: MOTIAZ.startDate, endDate: MOTIAZ.endDate, emiDay: MOTIAZ.emiDay,
+    }).installments,
+    179
+  );
+});
+
+test('Motiaz: the schedule runs 5 May 2026 to 5 Mar 2041 and closes to zero', () => {
+  const timeline = repaymentTimeline({
+    startDate: MOTIAZ.startDate, endDate: MOTIAZ.endDate, emiDay: MOTIAZ.emiDay,
+  });
+  const schedule = buildAmortizationSchedule({
+    principal: MOTIAZ.originalPrincipal,
+    annualRatePercent: MOTIAZ.interestRate,
+    emi: MOTIAZ.emiAmount,
+    startDate: MOTIAZ.startDate,
+    firstDueDate: timeline.firstDueDate,
+    periods: timeline.installments,
+  });
+
+  assert.equal(schedule.periods, 179);
+  assert.equal(schedule.rows[0].date.getFullYear(), 2026);
+  assert.equal(schedule.rows[0].date.getMonth(), 4); // May
+  assert.equal(schedule.rows[0].date.getDate(), 5);
+  assert.equal(schedule.rows[178].date.getFullYear(), 2041);
+  assert.equal(schedule.rows[178].date.getMonth(), 2); // March
+  assert.equal(schedule.rows[178].date.getDate(), 5);
+  assert.equal(schedule.closesToZero, true);
+  assert.equal(timeline.finalDueDate.getTime(), schedule.rows[178].date.getTime());
+});
+
+test('Motiaz REGRESSION: the dashboard payoff is the last instalment, not today + months', () => {
+  const summary = summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 9, 12) });
+
+  // The reported defect: 12 Sep 2041, i.e. today (12 Oct 2026) + 179 months.
+  assert.notEqual(summary.estimatedPayoffDate.getTime(), new Date(2041, 8, 12).getTime());
+
+  assert.equal(summary.estimatedPayoffDate.getFullYear(), 2041);
+  assert.equal(summary.estimatedPayoffDate.getMonth(), 2); // March
+  assert.equal(summary.estimatedPayoffDate.getDate(), 5); // the 5th, the EMI day
+  assert.equal(summary.estimatedPayoffDate.getTime(), summary.finalScheduledDate.getTime());
+});
+
+test('Motiaz REGRESSION: the next due instalment is the first UNPAID one', () => {
+  const summary = summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 9, 12) });
+
+  // The reported defect: 5 Nov 2026, which implied May-October were settled.
+  assert.notEqual(summary.nextDueDate.getTime(), new Date(2026, 10, 5).getTime());
+
+  assert.equal(summary.nextDueDate.getFullYear(), 2026);
+  assert.equal(summary.nextDueDate.getMonth(), 4); // May
+  assert.equal(summary.nextDueDate.getDate(), 5);
+  assert.equal(summary.remainingMonths, 179);
+  assert.equal(summary.remainingInstallments, 179);
+});
+
+test('Motiaz: with no payments recorded, past-due instalments stay visible', () => {
+  const summary = summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 9, 12) });
+  // 5 May, 5 Jun, 5 Jul, 5 Aug, 5 Sep and 5 Oct 2026 are all past due and unpaid.
+  assert.equal(summary.overdueInstallments, 6);
+
+  // The count is measured against the as-of date, not the wall clock.
+  assert.equal(summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 4, 4) }).overdueInstallments, 0);
+  assert.equal(summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 4, 5) }).overdueInstallments, 0);
+  assert.equal(summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 4, 6) }).overdueInstallments, 1);
+  // On 5 Jun the June instalment is due today, not yet overdue.
+  assert.equal(summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 5, 5) }).overdueInstallments, 1);
+  assert.equal(summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 5, 6) }).overdueInstallments, 2);
+});
+
+test('Motiaz: outstanding principal is the recorded history, never the projection', () => {
+  // Zero payments: the balance is the lender-supplied principal, and no
+  // projection is mistaken for a payment.
+  const summary = summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 9, 12) });
+  assert.equal(summary.outstandingPrincipal, 5500000);
+  assert.equal(summary.principalRepaid, 0);
+  assert.equal(summary.progressPercent, 0);
+  assert.equal(summary.balanceAsOfDate, null);
+  assert.equal(summary.paymentCount, 0);
+});
+
+test('Motiaz: a recorded EMI advances the due instalment and reduces the overdue count', () => {
+  const payment = {
+    id: 'p1',
+    date: new Date(2026, 4, 5),
+    principalAmount: 16765.13, // 51140.13 - 5500000 * 7.5% / 12
+    interestAmount: 34375,
+    extraPrincipal: 0,
+    totalAmount: 51140.13,
+  };
+
+  const summary = summarizeLoan(MOTIAZ, [payment], { asOf: new Date(2026, 9, 12) });
+  assert.equal(summary.outstandingPrincipal, fromPaise(toPaise(5500000) - toPaise(16765.13)));
+  assert.equal(summary.nextDueDate.getFullYear(), 2026);
+  assert.equal(summary.nextDueDate.getMonth(), 5); // June
+  assert.equal(summary.nextDueDate.getDate(), 5);
+  assert.equal(summary.overdueInstallments, 5); // Jun..Oct
+  assert.equal(summary.paymentCount, 1);
+  assert.equal(summary.balanceAsOfDate.getTime(), payment.date.getTime());
+});
+
+test('timeline: the first instalment falls in the month after disbursement', () => {
+  for (const [startY, startM, startD, day, expY, expM, expD] of [
+    [2026, 0, 1, 5, 2026, 1, 5], // 1 Jan -> 5 Feb
+    [2026, 3, 1, 5, 2026, 4, 5], // 1 Apr -> 5 May
+    [2026, 11, 15, 10, 2027, 0, 10], // 15 Dec -> 10 Jan
+    [2026, 0, 20, null, 2026, 1, 20], // no emiDay: the disbursement day
+  ]) {
+    const t = repaymentTimeline({ startDate: new Date(startY, startM, startD), emiDay: day });
+    assert.equal(t.firstDueDate.getFullYear(), expY, `year for ${startY}-${startM}-${startD}`);
+    assert.equal(t.firstDueDate.getMonth(), expM, `month for ${startY}-${startM}-${startD}`);
+    assert.equal(t.firstDueDate.getDate(), expD, `day for ${startY}-${startM}-${startD}`);
+  }
+});
+
+test('timeline: month-end dates clamp instead of rolling into the next month', () => {
+  const t = repaymentTimeline({
+    startDate: new Date(2026, 0, 31), // 31 Jan
+    endDate: new Date(2041, 1, 28),
+    emiDay: 31,
+  });
+  // 31 Jan + 1 month is 28 Feb, not 3 March.
+  assert.equal(t.firstDueDate.getMonth(), 1);
+  assert.equal(t.firstDueDate.getDate(), 28);
+
+  // Independent count from the clamped first due date: this is the case where
+  // the old start-to-end shortcut under-counted by one (180 instead of 181).
+  assert.equal(t.installments, countMonthsInclusive(t.firstDueDate, new Date(2041, 1, 28)));
+  assert.equal(t.installments, 181);
+  assert.equal(monthsBetween(new Date(2026, 0, 31), new Date(2041, 1, 28)), 180);
+});
+
+test('timeline: a leap-day disbursement clamps correctly', () => {
+  const t = repaymentTimeline({ startDate: new Date(2024, 0, 31), emiDay: 31 });
+  assert.equal(t.firstDueDate.getFullYear(), 2024);
+  assert.equal(t.firstDueDate.getMonth(), 1);
+  assert.equal(t.firstDueDate.getDate(), 29); // 2024 is a leap year
+
+  const t2 = repaymentTimeline({ startDate: new Date(2025, 0, 31), emiDay: 31 });
+  assert.equal(t2.firstDueDate.getDate(), 28); // 2025 is not
+});
+
+test('timeline: an explicit instalment count is preserved verbatim', () => {
+  for (const count of [12, 60, 179, 180, 240]) {
+    const t = repaymentTimeline({
+      startDate: new Date(2026, 0, 1),
+      endDate: new Date(2046, 0, 1),
+      emiDay: 5,
+      installments: count,
+    });
+    assert.equal(t.installments, count);
+    assert.equal(t.termSource, 'explicit');
+  }
+});
+
+test('timeline: 179 and 180 instalments produce different, correct schedules', () => {
+  for (const [count, emi] of [[179, 51140.13], [180, 50985.68]]) {
+    const t = repaymentTimeline({
+      startDate: MOTIAZ.startDate, endDate: MOTIAZ.endDate, emiDay: 5, installments: count,
+    });
+    const schedule = buildAmortizationSchedule({
+      principal: MOTIAZ.originalPrincipal,
+      annualRatePercent: MOTIAZ.interestRate,
+      emi,
+      startDate: MOTIAZ.startDate,
+      firstDueDate: t.firstDueDate,
+      periods: count,
+    });
+    assert.equal(schedule.periods, count, `${count} instalments`);
+    // Either way the loan must retire exactly the principal and close.
+    assert.equal(rupees(schedule.totalPrincipal + schedule.totalExtra), rupees(5500000));
+    assert.equal(schedule.closesToZero, true);
+    // Independently: the last date is the first due date plus count-1 months.
+    const expectedLast = addMonthsClamped(t.firstDueDate, count - 1);
+    assert.equal(schedule.rows[count - 1].date.getTime(), expectedLast.getTime());
+  }
+  // 179 instalments from May 2026 end in March 2041; 180 end in April 2041.
+  assert.equal(addMonthsClamped(new Date(2026, 4, 5), 178).getMonth(), 2);
+  assert.equal(addMonthsClamped(new Date(2026, 4, 5), 179).getMonth(), 3);
+});
+
+test('timeline: the EMI derived for a stated tenure clears that exact tenure', () => {
+  // A derived EMI must be computed over the same instalment count the schedule
+  // uses, otherwise the table cannot close on the stated term.
+  const derived = deriveEmiIfMissing({
+    originalPrincipal: 5500000,
+    interestRate: 7.5,
+    startDate: MOTIAZ.startDate,
+    endDate: MOTIAZ.endDate,
+    emiDay: 5,
+  });
+  assert.equal(derived, 51140.13);
+  assert.equal(remainingTenure(5500000, 7.5, derived), 179);
+});
+
+test('CONSISTENCY: dashboard, schedule projection and simulator agree on the payoff', () => {
+  const run = (payments, extraAmount) => {
+    const summary = summarizeLoan(MOTIAZ, payments, { asOf: new Date(2026, 9, 12) });
+
+    // Exactly the wiring the API uses for GET /schedule.
+    const projection = buildAmortizationSchedule({
+      principal: summary.outstandingPrincipal,
+      annualRatePercent: MOTIAZ.interestRate,
+      emi: MOTIAZ.emiAmount,
+      startDate: MOTIAZ.startDate,
+      firstDueDate: summary.nextDueDate,
+      periods: summary.remainingMonths,
+    });
+
+    // Exactly the wiring the API uses for POST /simulate.
+    const simulation = prepaymentSavings({
+      principal: MOTIAZ.originalPrincipal,
+      annualRatePercent: MOTIAZ.interestRate,
+      emi: MOTIAZ.emiAmount,
+      startDate: MOTIAZ.startDate,
+      currentBalance: summary.outstandingPrincipal,
+      extraAmount,
+      keepEmi: true,
+      fromDate: summary.nextDueDate,
+      firstDueDate: summary.nextDueDate,
+      periods: summary.remainingMonths,
+    });
+
+    return { summary, projection, simulation };
+  };
+
+  // No payments recorded.
+  const fresh = run([], 0);
+  const projectionEnd = fresh.projection.rows[fresh.projection.rows.length - 1].date;
+  assert.equal(projectionEnd.getTime(), fresh.summary.estimatedPayoffDate.getTime());
+  assert.equal(
+    fresh.simulation.baseline.payoffDate.getTime(),
+    fresh.summary.estimatedPayoffDate.getTime()
+  );
+  assert.equal(fresh.projection.periods, fresh.summary.remainingMonths);
+
+  // With a history and a prepayment.
+  const paid = run(
+    [{ id: 'a', date: new Date(2026, 4, 5), principalAmount: 16765.13, extraPrincipal: 0, interestAmount: 34375 }],
+    500000
+  );
+  const paidProjectionEnd = paid.projection.rows[paid.projection.rows.length - 1].date;
+  assert.equal(paidProjectionEnd.getTime(), paid.summary.estimatedPayoffDate.getTime());
+  assert.equal(
+    paid.simulation.baseline.payoffDate.getTime(),
+    paid.summary.estimatedPayoffDate.getTime()
+  );
+  assert.equal(paid.simulation.emiAfter, MOTIAZ.emiAmount, 'Decision B: the EMI is retained');
+  assert.ok(paid.simulation.interestSaved > 0);
+  assert.ok(paid.simulation.monthsSaved > 0);
+});
+
+test('CONSISTENCY: a prepayment shortens the timeline the dashboard reports', () => {
+  const before = summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 9, 12) });
+  const after = summarizeLoan(
+    MOTIAZ,
+    [{ id: 'pre', date: new Date(2026, 4, 5), principalAmount: 0, extraPrincipal: 1000000, interestAmount: 0 }],
+    { asOf: new Date(2026, 9, 12) }
+  );
+
+  assert.ok(after.remainingMonths < before.remainingMonths);
+  assert.ok(
+    after.estimatedPayoffDate.getTime() < before.estimatedPayoffDate.getTime(),
+    'a prepayment must move the payoff date earlier'
+  );
+  assert.ok(after.progressPercent > 0);
+});
+
+test('CONSISTENCY: the reported dates never depend on today', () => {
+  // Same loan, two different "today"s: every contractual date must be identical.
+  const a = summarizeLoan(MOTIAZ, [], { asOf: new Date(2026, 9, 12) });
+  const b = summarizeLoan(MOTIAZ, [], { asOf: new Date(2027, 5, 23) });
+
+  assert.equal(a.nextDueDate.getTime(), b.nextDueDate.getTime());
+  assert.equal(a.estimatedPayoffDate.getTime(), b.estimatedPayoffDate.getTime());
+  assert.equal(a.finalScheduledDate.getTime(), b.finalScheduledDate.getTime());
+  assert.equal(a.remainingMonths, b.remainingMonths);
+  // Only the overdue count is time-relative.
+  assert.ok(b.overdueInstallments > a.overdueInstallments);
+});
+
+test('REGRESSION: a prepayment does not settle instalments that were never paid', () => {
+  // A Rs 10,00,000 principal-only prepayment with no EMI ever recorded must NOT
+  // be read as "the first 24 instalments are settled". The May 2026 EMI is still
+  // the next one due; the prepayment only shortens the loan.
+  const prepayment = {
+    id: 'pre',
+    date: new Date(2026, 4, 5),
+    principalAmount: 0,
+    extraPrincipal: 1000000,
+    interestAmount: 0,
+    totalAmount: 1000000,
+  };
+
+  const summary = summarizeLoan(MOTIAZ, [prepayment], { asOf: new Date(2026, 9, 12) });
+
+  assert.equal(summary.nextDueDate.getFullYear(), 2026);
+  assert.equal(summary.nextDueDate.getMonth(), 4); // still May
+  assert.equal(summary.nextDueDate.getDate(), 5);
+  assert.equal(summary.overdueInstallments, 6);
+  assert.equal(summary.settledInstallments, 0);
+
+  // The prepayment is still honoured: less principal, shorter tenure, earlier payoff.
+  assert.equal(summary.outstandingPrincipal, 4500000);
+  assert.ok(summary.remainingMonths < 179);
+  assert.ok(summary.estimatedPayoffDate.getTime() < MOTIAZ.endDate.getTime());
+
+  // One recorded EMI settles exactly one instalment.
+  const withEmi = summarizeLoan(
+    MOTIAZ,
+    [
+      prepayment,
+      { id: 'e1', date: new Date(2026, 4, 5), principalAmount: 16765.13, interestAmount: 34375, extraPrincipal: 0 },
+    ],
+    { asOf: new Date(2026, 9, 12) }
+  );
+  assert.equal(withEmi.settledInstallments, 1);
+  assert.equal(withEmi.nextDueDate.getMonth(), 5); // June
+
+  assert.equal(settledInstallmentCount(MOTIAZ_PAYMENTS_FIXTURE, 3), 3, 'capped at the term');
+  assert.equal(settledInstallmentCount(MOTIAZ_PAYMENTS_FIXTURE, 1), 1);
+});
+
+const MOTIAZ_PAYMENTS_FIXTURE = [
+  { id: 'e1', date: new Date(2026, 4, 5), principalAmount: 100, interestAmount: 200, extraPrincipal: 0 },
+  { id: 'e2', date: new Date(2026, 5, 5), principalAmount: 100, interestAmount: 200, extraPrincipal: 0 },
+  { id: 'p1', date: new Date(2026, 6, 5), principalAmount: 0, interestAmount: 0, extraPrincipal: 5000 },
+  { id: 'e3', date: new Date(2026, 7, 5), principalAmount: 100, interestAmount: 200, extraPrincipal: 0 },
+];

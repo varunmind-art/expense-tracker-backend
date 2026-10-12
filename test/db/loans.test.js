@@ -73,7 +73,7 @@ const makeLoan = async (overrides = {}) =>
       originalPrincipal: 1000000,
       interestRate: 8.5,
       startDate: '2026-01-01',
-      endDate: '2046-01-01',
+      endDate: '2046-01-05',
       emiDay: 5,
       paymentAccountId: ID.accountA1,
       ...overrides,
@@ -350,6 +350,47 @@ test('POST /api/loans/:id/payments records an EMI with a correct split', async (
   await deleteLoanRow(id);
 });
 
+test('a prepayment does not advance the next due instalment, an EMI does', async () => {
+  const created = await makeLoan({ name: `${LOAN_PREFIX}DuePointer`, startDate: '2026-01-01', endDate: '2046-01-05' });
+  const id = created.json.id;
+
+  const fresh = await api('GET', `/api/loans/${id}/summary`, { token: tokenA });
+  const firstDue = fresh.json.nextDueDate;
+  assert.ok(firstDue, 'a fresh loan has a next due instalment');
+  assert.equal(new Date(firstDue).getDate(), 5);
+  assert.equal(new Date(firstDue).getMonth(), 1); // 5 Feb 2026
+  // The payoff is the loan's own final instalment, never today + months.
+  assert.equal(
+    new Date(fresh.json.estimatedPayoffDate).getTime() > new Date(firstDue).getTime(),
+    true
+  );
+
+  // A principal-only prepayment must NOT settle the February instalment.
+  await api('POST', `/api/loans/${id}/payments`, {
+    token: tokenA,
+    body: { amount: 100000, kind: 'PREPAYMENT', date: '2026-02-05' },
+  });
+  const afterPrepay = await api('GET', `/api/loans/${id}/summary`, { token: tokenA });
+  assert.equal(afterPrepay.json.nextDueDate, firstDue, 'a prepayment must not advance the due date');
+  assert.equal(afterPrepay.json.settledInstallments, 0);
+  assert.equal(afterPrepay.json.outstandingPrincipal, 900000);
+  assert.ok(
+    new Date(afterPrepay.json.estimatedPayoffDate) < new Date(fresh.json.estimatedPayoffDate),
+    'a prepayment must still shorten the loan'
+  );
+
+  // A recorded EMI settles exactly one instalment and advances the due date.
+  await api('POST', `/api/loans/${id}/payments`, {
+    token: tokenA,
+    body: { amount: 8678.24, kind: 'EMI', date: '2026-02-05' },
+  });
+  const afterEmi = await api('GET', `/api/loans/${id}/summary`, { token: tokenA });
+  assert.equal(afterEmi.json.settledInstallments, 1);
+  assert.equal(new Date(afterEmi.json.nextDueDate).getMonth(), 2); // 5 Mar 2026
+
+  await deleteLoanRow(id);
+});
+
 test('POST /api/loans/:id/payments records a prepayment as principal only', async () => {
   const created = await makeLoan({ name: `${LOAN_PREFIX}Prepay` });
   const id = created.json.id;
@@ -586,15 +627,36 @@ test('GET /api/loans/:id/schedule separates actuals from the forecast', async ()
   assert.equal(res.json.schedule.planned.closesToZero, true);
   assert.equal(res.json.schedule.planned.totalPrincipal, 1000000);
 
-  // Exactly one period is covered by an actual payment; the rest is forecast.
+  // Exactly one period is covered by an actual payment.
   const paid = res.json.schedule.rows.filter((row) => row.status === 'PAID');
   const forecast = res.json.schedule.rows.filter((row) => row.status === 'FORECAST');
+  const overdue = res.json.schedule.rows.filter((row) => row.status === 'OVERDUE');
   assert.equal(paid.length, 1, JSON.stringify(res.json.schedule.rows.filter((r) => r.status !== 'FORECAST')));
-  assert.equal(forecast.length, 239);
   assert.equal(paid[0].period, 1);
   assert.equal(paid[0].actual.principalAmount, 1594.91);
   assert.equal(paid[0].actual.paymentIds.length, 1);
   assert.equal(forecast[0].actual, null);
+
+  // Every period is accounted for, and no unrecorded instalment disappears.
+  assert.equal(paid.length + forecast.length + overdue.length, 240);
+
+  // The invariant that matters, and which is independent of the wall clock: an
+  // instalment whose due date has passed with nothing recorded must never be
+  // presented as a forecast.
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  for (const row of forecast) {
+    assert.ok(new Date(row.date).getTime() >= today.getTime(), `period ${row.period} is past due but labelled FORECAST`);
+  }
+  // ...and because only the very first EMI was recorded, every later instalment
+  // whose due date has passed must show as overdue rather than disappearing into
+  // the forecast.
+  assert.ok(overdue.length > 0, 'the fixture starts in 2026, so instalments are overdue');
+  assert.equal(overdue[0].period, 2, 'the instalment right after the paid one is the first overdue');
+  for (const row of overdue) {
+    assert.ok(new Date(row.date).getTime() < today.getTime(), `period ${row.period} is not past due but labelled OVERDUE`);
+    assert.equal(row.actual, null);
+  }
 
   // The projection starts from the reduced balance.
   assert.equal(res.json.projection.fromBalance, 998405.09);
@@ -836,7 +898,7 @@ test('an unauthenticated request is refused on every loan route', async () => {
 
 test('acceptance: add a loan, pay an EMI, prepay, and see the payoff move', async () => {
   // 1. Add a loan.
-  const created = await makeLoan({ name: `${LOAN_PREFIX}Acceptance`, originalPrincipal: 2000000, interestRate: 9, startDate: '2026-01-01', endDate: '2046-01-01' });
+  const created = await makeLoan({ name: `${LOAN_PREFIX}Acceptance`, originalPrincipal: 2000000, interestRate: 9, startDate: '2026-01-01', endDate: '2046-01-05' });
   assert.equal(created.status, 201, created.text);
   const id = created.json.id;
 
@@ -1008,6 +1070,108 @@ test('the API payload carries every field the Loan UI reads', async () => {
     simulation.json.rateChange,
     ['newRatePercent', 'changedFrom', 'unaffectedPeriods', 'balanceAtChange', 'newTotalInterest', 'totalInterestDelta', 'newPayoffDate', 'monthsDelta', 'emiForSameTenure', 'baseline'],
     'simulate.rateChange'
+  );
+
+  await deleteLoanRow(id);
+});
+
+// ---------------------------------------------------------------------------
+// API-level timeline consistency (the production Motiaz Blue Ridge shape)
+// ---------------------------------------------------------------------------
+
+test('a loan whose maturity falls off the EMI day keeps one consistent timeline', async () => {
+  // Rs 55,00,000 @ 7.5%, disbursed 1 Apr 2026, EMIs on the 5th, maturing
+  // 30 Mar 2041. The 179-instalment instalment is 51,140.13.
+  const created = await makeLoan({
+    name: `${LOAN_PREFIX}Timeline`,
+    originalPrincipal: 5500000,
+    interestRate: 7.5,
+    emiAmount: 51140.13,
+    startDate: '2026-04-01',
+    endDate: '2041-03-30',
+    emiDay: 5,
+  });
+  assert.equal(created.status, 201, created.text);
+  const id = created.json.id;
+
+  const detail = await api('GET', `/api/loans/${id}`, { token: tokenA });
+  const summary = detail.json.summary;
+  const schedule = await api('GET', `/api/loans/${id}/schedule`, { token: tokenA });
+  const simulation = await api('POST', `/api/loans/${id}/simulate`, { token: tokenA, body: { extraAmount: 0 } });
+
+  // --- the term is 179, not 180, and it comes from the first EMI date --------
+  assert.equal(summary.installments, 179);
+  assert.equal(summary.termSource, 'endDate');
+  assert.equal(schedule.json.contractualMonths, 179);
+  assert.equal(schedule.json.schedule.rows.length, 179);
+
+  // --- every date derives from the loan's own timeline, not the wall clock ---
+  assert.equal(new Date(summary.firstDueDate).getDate(), 5);
+  assert.equal(new Date(summary.firstDueDate).getMonth(), 4); // 5 May 2026
+  assert.equal(new Date(summary.firstDueDate).getFullYear(), 2026);
+
+  const rows = schedule.json.schedule.rows;
+  assert.equal(new Date(rows[0].date).getTime(), new Date(summary.firstDueDate).getTime());
+  assert.equal(new Date(rows[178].date).getTime(), new Date(summary.finalScheduledDate).getTime());
+  assert.equal(new Date(rows[178].date).getMonth(), 2); // March 2041
+  assert.equal(new Date(rows[178].date).getFullYear(), 2041);
+
+  // --- the next due instalment is the first UNPAID one, never a calendar guess
+  assert.equal(new Date(summary.nextDueDate).getTime(), new Date(rows[0].date).getTime());
+  assert.equal(new Date(detail.json.nextEmiDate).getTime(), new Date(summary.nextDueDate).getTime());
+
+  // --- the dashboard payoff is the loan's final instalment ------------------
+  assert.equal(new Date(summary.estimatedPayoffDate).getTime(), new Date(rows[178].date).getTime());
+
+  // --- dashboard, schedule and simulator all report the SAME payoff ---------
+  assert.equal(
+    new Date(schedule.json.projection.estimatedPayoffDate).getTime(),
+    new Date(summary.estimatedPayoffDate).getTime(),
+    'the schedule projection must agree with the dashboard'
+  );
+  assert.equal(
+    new Date(simulation.json.prepayment.baseline.payoffDate).getTime(),
+    new Date(summary.estimatedPayoffDate).getTime(),
+    'the simulator baseline must agree with the dashboard'
+  );
+  assert.equal(
+    new Date(schedule.json.summary.estimatedPayoffDate).getTime(),
+    new Date(summary.estimatedPayoffDate).getTime()
+  );
+
+  // --- unrecorded historical instalments are visible, not assumed paid ------
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const pastDue = rows.filter((row) => new Date(row.date).getTime() < today.getTime());
+  assert.ok(pastDue.length > 0, 'this loan started in the past, so instalments are past due');
+  assert.equal(summary.overdueInstallments, pastDue.length);
+  assert.equal(summary.settledInstallments, 0);
+  assert.equal(summary.paymentCount, 0);
+  for (const row of pastDue) {
+    assert.equal(row.status, 'OVERDUE', `period ${row.period} is past due but labelled ${row.status}`);
+  }
+  for (const row of rows.filter((r) => new Date(r.date).getTime() >= today.getTime())) {
+    assert.equal(row.status, 'FORECAST', `period ${row.period} is in the future but labelled ${row.status}`);
+  }
+
+  // --- no projection has been mistaken for a payment -----------------------
+  assert.equal(summary.outstandingPrincipal, 5500000);
+  assert.equal(summary.principalRepaid, 0);
+  assert.equal(summary.progressPercent, 0);
+  assert.equal(summary.isClosed, false);
+
+  // --- a prepayment shortens it without settling any instalment ------------
+  await api('POST', `/api/loans/${id}/payments`, {
+    token: tokenA,
+    body: { amount: 1000000, kind: 'PREPAYMENT', date: '2026-05-05' },
+  });
+  const after = await api('GET', `/api/loans/${id}/summary`, { token: tokenA });
+  assert.equal(after.json.nextDueDate, summary.nextDueDate, 'a prepayment must not advance the due date');
+  assert.equal(after.json.outstandingPrincipal, 4500000);
+  assert.ok(after.json.remainingMonths < 179);
+  assert.ok(
+    new Date(after.json.estimatedPayoffDate).getTime() < new Date(summary.estimatedPayoffDate).getTime(),
+    'a prepayment must move the payoff earlier'
   );
 
   await deleteLoanRow(id);

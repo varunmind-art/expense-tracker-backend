@@ -56,6 +56,8 @@ const {
   validateLoanInput,
   addMonthsClamped,
   monthsBetween,
+  startOfDay,
+  repaymentTimeline,
   toPaise,
   fromPaise,
   num,
@@ -5107,8 +5109,16 @@ const decimalToNumber = (value) =>
 
 /** Contractual tenure in months when the loan states both dates. */
 const contractualMonths = (loan) => {
-  const months = monthsBetween(loan.startDate, loan.endDate);
-  return months > 0 ? months : null;
+  const timeline = repaymentTimeline({
+    startDate: loan.startDate,
+    endDate: loan.endDate,
+    emiDay: loan.emiDay,
+    installments: loan.installments,
+    emiAmount: loan.emiAmount ?? 0,
+    interestRate: loan.interestRate ?? 0,
+    originalPrincipal: loan.originalPrincipal,
+  });
+  return timeline.installments;
 };
 
 /** Never expose raw Decimal objects (they serialise as strings). */
@@ -5246,23 +5256,6 @@ const resyncLoanLedger = async (loan, client = prisma) => {
   return { payments, currentPrincipal };
 };
 
-/** The next EMI due date, or null when the loan does not state a day. */
-const nextEmiDateFor = (loan, payments = []) => {
-  if (loan.isActive === false) return null;
-  const start = loan.startDate ? new Date(loan.startDate) : null;
-  const day = loan.emiDay || (start ? start.getDate() : null);
-  if (!day) return null;
-
-  const now = new Date();
-  const lastPaid = payments.length ? new Date(payments[payments.length - 1].date) : null;
-  const from = lastPaid && lastPaid.getTime() > now.getTime() ? lastPaid : now;
-
-  const lastDayThisMonth = new Date(from.getFullYear(), from.getMonth() + 1, 0).getDate();
-  const thisMonth = new Date(from.getFullYear(), from.getMonth(), Math.min(day, lastDayThisMonth));
-  if (thisMonth.getTime() > from.getTime()) return thisMonth;
-  return addMonthsClamped(thisMonth, 1);
-};
-
 /**
  * Attach actual payments to the periods of a lifetime schedule.
  * A row is PAID / PARTIAL / FORECAST, so the UI can style history and forecast
@@ -5287,7 +5280,11 @@ const annotateSchedule = (rows, payments) => {
   return rows.map((row, index) => {
     const group = buckets[index];
     if (group.length === 0) {
-      return { ...row, status: 'FORECAST', actual: null };
+      // An instalment whose due date has passed with nothing recorded is NOT a
+      // forecast. It is an unrecorded historical instalment and must be visible.
+      const dueMs = row.date ? startOfDay(row.date).getTime() : null;
+      const isPastDue = dueMs !== null && dueMs < startOfDay(new Date()).getTime();
+      return { ...row, status: isPastDue ? 'OVERDUE' : 'FORECAST', actual: null };
     }
 
     const sum = (key) => group.reduce((total, p) => total + toPaise(p[key]), 0);
@@ -5345,11 +5342,16 @@ app.get(
         : loans.filter((loan) => String(loan.isActive) === String(activeFilter));
 
       res.json(
-        filtered.map((loan) => ({
-          ...serializeLoan(loan),
-          summary: summarizeLoan(loan, loan.payments),
-          nextEmiDate: nextEmiDateFor(loan, loan.payments),
-        }))
+        filtered.map((loan) => {
+          const summary = summarizeLoan(loan, loan.payments);
+          return {
+            ...serializeLoan(loan),
+            summary,
+            // Kept as its own field for the existing client; by construction it
+            // is the same date as `summary.nextDueDate`.
+            nextEmiDate: summary.nextDueDate,
+          };
+        })
       );
     } catch (error) {
       console.error('Fetch loans error:', error);
@@ -5402,10 +5404,26 @@ app.post(
 
       // An EMI without an end date still implies one; derive it so the schedule
       // has a contractual tenure to close against.
+      const seedTimeline = repaymentTimeline({
+        startDate: input.startDate,
+        endDate: input.endDate,
+        emiDay: input.emiDay,
+        installments: input.installments,
+        emiAmount,
+        interestRate,
+        originalPrincipal,
+      });
+
       let endDate = input.endDate ?? null;
-      if (!endDate && input.startDate && emiAmount) {
+      if (input.installments && seedTimeline.firstDueDate) {
+        // An explicit instalment count fixes the maturity at the LAST due date,
+        // so the timeline round-trips to exactly that count.
+        endDate = addMonthsClamped(seedTimeline.firstDueDate, input.installments - 1);
+      } else if (!endDate && seedTimeline.firstDueDate && emiAmount) {
         const months = remainingTenure(currentPrincipal, interestRate, emiAmount);
-        if (months && months > 0) endDate = addMonthsClamped(input.startDate, months);
+        if (months && months > 0) {
+          endDate = addMonthsClamped(seedTimeline.firstDueDate, months - 1);
+        }
       }
 
       const loan = await prisma.loan.create({
@@ -5426,10 +5444,12 @@ app.post(
         },
       });
 
+      const createdSummary = summarizeLoan(loan, []);
+
       res.status(201).json({
         ...serializeLoan(loan),
-        summary: summarizeLoan(loan, []),
-        nextEmiDate: nextEmiDateFor(loan, []),
+        summary: createdSummary,
+        nextEmiDate: createdSummary.nextDueDate,
       });
     } catch (error) {
       console.error('Create loan error:', error);
@@ -5449,10 +5469,12 @@ app.get(
       if (!context) return loanNotFound(res);
 
       const { loan, payments } = context;
+      const detailSummary = summarizeLoan(loan, payments);
+
       res.json({
         ...serializeLoan(loan),
-        summary: summarizeLoan(loan, payments),
-        nextEmiDate: nextEmiDateFor(loan, payments),
+        summary: detailSummary,
+        nextEmiDate: detailSummary.nextDueDate,
         payments: payments.map(serializePayment),
       });
     } catch (error) {
@@ -5479,6 +5501,8 @@ app.put(
 
       const input = validation.value;
       const updates = { ...input };
+      // `installments` is an input convenience, never a stored column.
+      delete updates.installments;
 
       if (input.paymentAccountId !== undefined && !(await ownedAccountExists(req.user.id, input.paymentAccountId))) {
         return res.status(400).json({ error: 'Payment account not found.' });
@@ -5515,18 +5539,29 @@ app.put(
       // Keep the implied end date in step when the tenure inputs changed.
       if (updates.endDate === undefined && input.startDate !== undefined && !existing.endDate) {
         const emi = input.emiAmount === undefined ? Number(existing.emiAmount ?? 0) : input.emiAmount;
-        if (emi > 0 && input.startDate) {
+        const seed = repaymentTimeline({
+          startDate: input.startDate,
+          endDate: null,
+          emiDay: input.emiDay === undefined ? existing.emiDay : input.emiDay,
+          emiAmount: emi,
+          interestRate: nextRate,
+          originalPrincipal: nextOriginal,
+        });
+        if (emi > 0 && seed.firstDueDate) {
           const months = remainingTenure(updates.currentPrincipal ?? Number(existing.currentPrincipal), nextRate, emi);
-          if (months && months > 0) updates.endDate = addMonthsClamped(input.startDate, months);
+          if (months && months > 0) {
+            updates.endDate = addMonthsClamped(seed.firstDueDate, months - 1);
+          }
         }
       }
 
       const loan = await prisma.loan.update({ where: { id: existing.id }, data: updates });
+      const updatedSummary = summarizeLoan(loan, payments);
 
       res.json({
         ...serializeLoan(loan),
-        summary: summarizeLoan(loan, payments),
-        nextEmiDate: nextEmiDateFor(loan, payments),
+        summary: updatedSummary,
+        nextEmiDate: updatedSummary.nextDueDate,
       });
     } catch (error) {
       console.error('Update loan error:', error);
@@ -5905,7 +5940,7 @@ app.get(
 
       res.json({
         ...summary,
-        nextEmiDate: nextEmiDateFor(loan, payments),
+        nextEmiDate: summary.nextDueDate,
         contractualMonths: contractualMonths(loan),
         scheduledEmi: loan.emiAmount === null ? null : Number(loan.emiAmount),
       });
@@ -5927,34 +5962,42 @@ app.get(
       const { loan, payments } = context;
       const rate = Number(loan.interestRate ?? 0);
       const emi = Number(loan.emiAmount ?? 0);
-      const outstanding = outstandingBalance(loan, payments);
-      const months = contractualMonths(loan);
+      const summary = summarizeLoan(loan, payments);
+      const outstanding = summary.outstandingPrincipal;
+      const months = summary.installments;
 
       // The loan's whole life, with actual payments marked against each period.
+      // Dated from the contractual first due date, so period 1 is the first
+      // instalment the borrower actually owes (5 May 2026), not the disbursement
+      // day shifted by one month (1 May 2026).
       const lifetime = buildAmortizationSchedule({
         principal: Number(loan.originalPrincipal),
         annualRatePercent: rate,
         emi,
         startDate: loan.startDate,
+        firstDueDate: summary.firstDueDate,
         periods: months,
       });
 
       // What is still to come, rebuilt from the CURRENT balance so every actual
-      // prepayment is already reflected in the projection.
-      const remainingMonths = emi > 0 ? remainingTenure(outstanding, rate, emi) : null;
-      const projection = emi > 0 && outstanding > 0
+      // prepayment is already reflected. Anchored on the next unpaid due date and
+      // running the same number of instalments as the summary, which is what makes
+      // the projected payoff date identical to the dashboard payoff date.
+      const remainingMonths = summary.remainingMonths;
+      const projection = emi > 0 && outstanding > 0 && summary.nextDueDate && remainingMonths > 0
         ? buildAmortizationSchedule({
             principal: outstanding,
             annualRatePercent: rate,
             emi,
-            startDate: nextEmiDateFor(loan, payments) || new Date(),
+            startDate: loan.startDate,
+            firstDueDate: summary.nextDueDate,
             periods: remainingMonths,
           })
         : buildAmortizationSchedule({ principal: 0, annualRatePercent: rate, emi, startDate: null });
 
       res.json({
         loan: serializeLoan(loan),
-        summary: summarizeLoan(loan, payments),
+        summary,
         contractualMonths: months,
         scheduledEmi: loan.emiAmount === null ? null : Number(loan.emiAmount),
         schedule: {
@@ -6007,7 +6050,8 @@ app.post(
       const body = req.body || {};
       const rate = Number(loan.interestRate ?? 0);
       const emi = Number(loan.emiAmount ?? 0);
-      const outstanding = outstandingBalance(loan, payments);
+      const summary = summarizeLoan(loan, payments);
+      const outstanding = summary.outstandingPrincipal;
 
       const extraAmount = num(body.extraAmount);
       const monthlyExtra = num(body.monthlyExtra);
@@ -6036,8 +6080,11 @@ app.post(
         extraAmount,
         monthlyExtra,
         keepEmi,
-        fromDate: nextEmiDateFor(loan, payments) || new Date(),
-        periods: remainingTenure(outstanding, rate, emi),
+        // Anchored on the loan's own next unpaid due date so the simulator's
+        // "current" payoff date is the same date the dashboard shows.
+        fromDate: summary.nextDueDate,
+        firstDueDate: summary.nextDueDate,
+        periods: summary.remainingMonths,
       });
 
       let rateChange = null;
@@ -6071,7 +6118,7 @@ app.post(
 
       res.json({
         loan: serializeLoan(loan),
-        summary: summarizeLoan(loan, payments),
+        summary,
         input: { extraAmount, monthlyExtra, keepEmi, newRate: body.newRate ?? null },
         prepayment,
         rateChange,
