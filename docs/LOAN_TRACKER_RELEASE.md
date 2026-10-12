@@ -105,6 +105,7 @@ Coverage of the acceptance criteria:
 | Frontend production build | `npm run build` | built, `dist/` produced |
 | Prisma Client + backend build | `npm run build` | **11 models / 106 scalar fields verified** |
 | Generated client has the models | runtime probe | `prisma.loan` ✓ `prisma.loanPayment` ✓ `User.tokenVersion` ✓ |
+| **Clean-checkout install and build** | repo copied without `node_modules`, then `npm install` → `npm run build` → boot | **exit 0 at every step**; `/ping` → 200, `/api/loans` → 401 |
 
 ### Development migration history (read-only probe)
 
@@ -383,10 +384,17 @@ A: `LoanPayment` is the sole source of truth for loan payments).
 
 ## 6. Known limitations (carried, not hidden)
 
-1. **Clean-install build is unproven.** `node_modules` is committed, so
-   `npm install` on a clean Render builder has not been exercised end to end.
-   Step 3 is the first real test of that path; if it fails, the fallback is to
-   build from the committed `node_modules` and ensure `prisma generate` still runs.
+1. **Clean-install build: VERIFIED, with one local-only caveat.** A checkout
+   without `node_modules` was installed fresh and built end to end: `npm install`
+   (which runs the `prisma generate` postinstall), then `npm run build`
+   (regenerate + verify), then a boot check that returned 200 from `/ping` and
+   401 from `/api/loans`. This is the same sequence Render will run.
+   Caveat, local only: in this workspace `prisma generate` fails with `EPERM`
+   because the shared engine cache `~/.cache/prisma` is outside the sandbox and
+   not writable. Redirecting `HOME` to a writable directory made it pass. Render
+   provides a writable `HOME` and its own cache, so this does not apply there —
+   but if the Render build ever fails at `prisma generate`, this is the cause to
+   check first.
 2. **`DISABLE_SCHEDULERS` is fail-open** — absent means the schedulers run. This is
    a pre-existing risk unrelated to Loan Tracker and is unchanged by this release.
 3. **Concurrent payment writes.** Two simultaneous payment requests for the same
