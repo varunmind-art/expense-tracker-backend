@@ -92,6 +92,34 @@ Coverage of the acceptance criteria:
    user A's loan, and cannot reach user A's payment ids through their own loan.
 9. **Frontend/API contract** — `P0-9.4` pins every field the UI reads.
 
+### Re-verified at the release-readiness gate (2026-10-12)
+
+| Check | Command | Result |
+|---|---|---|
+| Loan mathematics | `node --test test/p0/loans.test.js` | **76 pass, 0 fail** |
+| Backend offline suite | `npm test` | **291 pass, 0 fail**, 2 todo |
+| Whole database suite | `npm run test:db` | **62 pass, 0 fail**, 2 todo |
+| Loan API tests | `test/db/loans.test.js` | **28 pass, 0 fail** |
+| Test-isolation guard | `test/p0/no-server-import.test.js` | **2 pass** |
+| Frontend suite | `npm test` | **64 pass, 0 fail** |
+| Frontend production build | `npm run build` | built, `dist/` produced |
+| Prisma Client + backend build | `npm run build` | **11 models / 106 scalar fields verified** |
+| Generated client has the models | runtime probe | `prisma.loan` ✓ `prisma.loanPayment` ✓ `User.tokenVersion` ✓ |
+
+### Development migration history (read-only probe)
+
+All 10 migrations are `applied`, **0 failed or incomplete**, both required
+migrations included, and 12 application tables exist including `Loan` and
+`LoanPayment`. The dev database was left with **0 loan and 0 payment rows**, which
+confirms the test fixtures clean up after themselves.
+
+Each Prisma migration runs inside a transaction on PostgreSQL, so a migration that
+fails part-way is rolled back as a unit and leaves no half-applied schema. Combined
+with the fact that both required migrations are **purely additive**
+(`ADD COLUMN ... NULL`, `CREATE TABLE`, `CREATE INDEX`, `ADD CONSTRAINT`, and one
+`ADD COLUMN ... NOT NULL DEFAULT 0`), the schema step cannot destroy existing
+Expense Tracker data.
+
 ---
 
 ## 3. Release dependencies — read before deploying
@@ -162,25 +190,79 @@ pages render errors against a 404.
 
 ### Step 0 — Pre-flight, read-only ⛔
 
-Confirm the production migration state **before** changing anything.
+Confirm the production target and migration state **before** changing anything.
 
 ```bash
 cd expense-tracker-backend
-# Uses the production DIRECT_URL from the Render environment, not from this repo.
+
+# 0a. Confirm the target is production and nothing else.
+#     Print only the host and database name — never the credential.
 DATABASE_URL="<production DIRECT_URL>" npx prisma migrate status
+
+# 0b. Snapshot the pre-migration baseline (read-only). Keep this output.
+DATABASE_URL="<production DIRECT_URL>" npx prisma db execute --stdin <<'SQL'
+SELECT migration_name, finished_at, rolled_back_at FROM "_prisma_migrations" ORDER BY started_at;
+SQL
 ```
 
 Expected: a list of migrations with `20261004_add_accounts_and_loans` and
-`20261010225757_add_user_token_version` marked as applied or pending.
+`20261010225757_add_user_token_version` marked applied or **pending**, and a
+baseline snapshot to compare against afterwards.
 
-Record the output. If `migrate status` reports a **failed** migration or drift,
-stop and investigate — do not proceed to `migrate deploy`.
+Also record, as the "known good" reference for acceptance step 8:
 
-### Step 1 — Back up production ⛔
+```bash
+DATABASE_URL="<production DIRECT_URL>" npx prisma db execute --stdin <<'SQL'
+SELECT (SELECT COUNT(*) FROM "User") AS users,
+       (SELECT COUNT(*) FROM "Expense") AS expenses,
+       (SELECT COUNT(*) FROM "Income") AS incomes;
+SQL
+```
 
-Take a Neon branch or a `pg_dump` of the production database. Both migrations are
-additive (new tables, one new column with a default), so a rollback should not be
-needed, but the backup must exist before the schema changes.
+**Stop and investigate if:** the host is not the production host, `migrate status`
+reports a **failed** migration, or it reports drift. Do not proceed to
+`migrate deploy`.
+
+**Contingency — the tables already exist but the migration is not recorded.**
+If `migrate status` says the loan migration is pending yet `"Loan"` already exists
+in production (someone created it by hand), `migrate deploy` will fail with
+"relation already exists". In that case mark it applied instead of re-running it:
+
+```bash
+DATABASE_URL="<production DIRECT_URL>" npx prisma migrate resolve --applied 20261004_add_accounts_and_loans
+```
+
+### Step 1 — Back up / establish the restore point ⛔
+
+`pg_dump` and `psql` are **not installed in this workspace**, and the P0-7 policy
+forbids copying production financial rows into the development project. So the
+backup is Neon's own history, plus a recorded baseline:
+
+1. **Record the restore timestamp.** Immediately before `migrate deploy`, note the
+   UTC time (e.g. `date -u +%Y-%m-%dT%H:%M:%SZ`). Neon keeps a continuous
+   point-in-time-restore window for the production project; this timestamp is the
+   restore point. Confirm the window length in the Neon console first — it must
+   comfortably exceed the maintenance window.
+2. **Snapshot in-project (optional but preferred).** Create a Neon *branch of the
+   production project* as a labelled pre-release snapshot. This stays inside the
+   production project and does not copy production rows anywhere new. Do **not**
+   branch production into the development project.
+3. **Every step above is additive**, so recovery normally means redeploying the
+   previous build, not restoring data.
+
+### Step 1b — Rollback actions, in order of severity
+
+| Situation | Action |
+|---|---|
+| Build or deploy fails | Redeploy the previous Render build. Schema is untouched. |
+| A migration fails part-way | It rolled back as a unit. Fix the cause, then re-run `migrate deploy`. If the history row is stuck, `npx prisma migrate resolve --rolled-back <migration_name>`. |
+| API returns 500 on all authenticated routes | Suspect a missing `tokenVersion` column. Re-check step 2 and `migrate status`. |
+| Frontend broken | Redeploy the previous Vercel build. |
+| Data corruption | Restore production to the recorded pre-migration timestamp (Neon PITR / the pre-release branch). **This is the only destructive path — it requires explicit human approval.** |
+
+**Never drop `User.tokenVersion` to roll back.** The current `authenticateToken`
+reads it on every authenticated request; leaving the schema ahead of the code is
+the safe direction.
 
 ### Step 2 — Apply migrations ⛔
 
@@ -232,7 +314,33 @@ not take.
 - Environment variable: `VITE_API_URL=https://<backend-host>/api`
 
 `VITE_*` variables are baked in at build time — changing `VITE_API_URL` requires a
-**rebuild**, not just a restart.
+**rebuild**, not just a restart. The value must be the backend origin **including
+`/api`**, e.g. `https://<backend-host>/api`, because every call is written as
+`api.get('/loans')`.
+
+**CORS needs no configuration.** The backend mounts `app.use(cors())`, so the
+Vercel origin does not need to be whitelisted.
+
+### Step 5a — SPA deep-link fallback (conditional)
+
+`/loans/:id` is the primary loan screen, and like the existing `/expenses` and
+`/budgets` routes it is client-side. If a **hard refresh or a direct link** to a
+sub-route returns a Vercel 404, the project is missing its rewrite and the loan
+detail screen is not directly reachable.
+
+The repository has never contained a `vercel.json`, so this cannot be verified from
+here. Check it as part of the acceptance test (step 6, item 9). If it fails, add
+`vercel.json` to the frontend repository root and redeploy:
+
+```json
+{
+  "rewrites": [{ "source": "/((?!assets/|favicon\.svg|icon-192\.png|icon-512\.png|icons\.svg|manifest\.webmanifest|registerSW\.js|sw\.js|workbox-).*)", "destination": "/index.html" }]
+}
+```
+
+The exclusions keep build assets (`/assets/...`) and the service-worker files out
+of the rewrite, so the rewrite is safe regardless of whether Vercel resolves
+static files before or after rewrites. Deleting the file fully reverts the change.
 
 ### Step 6 — Smoke test in the browser
 
@@ -249,6 +357,11 @@ Sign in on the deployed frontend and run the seven acceptance steps:
 6. Open **Prepayment simulator** — interest saved and tenure reduced are both
    positive and the payoff date moves earlier.
 7. Repeat 1–3 with a second loan; both appear on **My Loans**.
+8. Confirm the existing Expense Tracker screens and totals are unchanged
+   (`/expenses`, `/budgets`, `/income`, the dashboard) and that the row counts
+   from step 0b still match for `User`, `Expense` and `Income`.
+9. **Hard-refresh** on `/loans/<id>` and load it in a new tab. If this 404s, apply
+   step 5a.
 
 Then confirm the payment you recorded did **not** appear as an Expense (Decision
 A: `LoanPayment` is the sole source of truth for loan payments).
