@@ -901,3 +901,114 @@ test('acceptance: add a loan, pay an EMI, prepay, and see the payoff move', asyn
   await deleteLoanRow(id);
   await deleteLoanRow(second.json.id);
 });
+
+// ---------------------------------------------------------------------------
+// frontend contract
+// ---------------------------------------------------------------------------
+
+/**
+ * The Loan UI reads these exact field names. Rendering a missing field shows
+ * "undefined" or "₹NaN" on screen, so the contract is asserted here rather than
+ * discovered by a user. If any of these change, the frontend must change too.
+ */
+const assertHasKeys = (object, keys, where) => {
+  for (const key of keys) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(object, key),
+      `${where} is missing the field "${key}" that the frontend reads`
+    );
+  }
+};
+
+test('the API payload carries every field the Loan UI reads', async () => {
+  const created = await makeLoan({ name: `${LOAN_PREFIX}Contract` });
+  const id = created.json.id;
+
+  await api('POST', `/api/loans/${id}/payments`, {
+    token: tokenA,
+    body: { amount: 8678.24, kind: 'EMI', date: '2026-02-05', note: 'February EMI' },
+  });
+  await api('POST', `/api/loans/${id}/payments`, {
+    token: tokenA,
+    body: { amount: 50000, kind: 'PREPAYMENT', date: '2026-03-05' },
+  });
+
+  // ---- GET /api/loans (the dashboard cards) --------------------------------
+  const list = await api('GET', '/api/loans', { token: tokenA });
+  const item = list.json.find((loan) => loan.id === id);
+  assert.ok(item, 'the created loan must appear in the list');
+  assertHasKeys(
+    item,
+    ['id', 'name', 'lender', 'loanType', 'originalPrincipal', 'currentPrincipal', 'interestRate', 'emiAmount', 'startDate', 'endDate', 'emiDay', 'isActive', 'paymentAccountId', 'summary', 'nextEmiDate'],
+    'GET /api/loans[]'
+  );
+  assertHasKeys(
+    item.summary,
+    ['originalPrincipal', 'outstandingPrincipal', 'principalRepaid', 'totalAmountPaid', 'totalInterestPaid', 'progressPercent', 'interestRate', 'emiAmount', 'remainingMonths', 'estimatedPayoffDate', 'paymentCount', 'isClosed', 'lastPaymentDate'],
+    'GET /api/loans[].summary'
+  );
+
+  // ---- GET /api/loans/:id/payments (the history table) --------------------
+  const history = await api('GET', `/api/loans/${id}/payments`, { token: tokenA });
+  assertHasKeys(history.json, ['loanId', 'count', 'totals', 'outstandingPrincipal', 'payments'], 'GET /api/loans/:id/payments');
+  assertHasKeys(
+    history.json.totals,
+    ['totalPaid', 'totalPrincipal', 'totalExtra', 'totalInterest'],
+    'GET /api/loans/:id/payments.totals'
+  );
+  assertHasKeys(
+    history.json.payments[0],
+    ['id', 'loanId', 'date', 'totalAmount', 'principalAmount', 'interestAmount', 'extraPrincipal', 'outstandingAfter', 'note'],
+    'GET /api/loans/:id/payments.payments[]'
+  );
+
+  // ---- GET /api/loans/:id/schedule (the amortization table) ---------------
+  const schedule = await api('GET', `/api/loans/${id}/schedule`, { token: tokenA });
+  assertHasKeys(schedule.json, ['loan', 'summary', 'contractualMonths', 'scheduledEmi', 'schedule', 'projection'], 'GET /api/loans/:id/schedule');
+  assertHasKeys(schedule.json.schedule, ['rows', 'planned', 'actualTotals'], 'schedule.schedule');
+  assertHasKeys(
+    schedule.json.schedule.planned,
+    ['periods', 'totalInterest', 'totalPrincipal', 'totalExtra', 'totalPayments', 'closesToZero', 'amortizes'],
+    'schedule.planned'
+  );
+  assertHasKeys(
+    schedule.json.projection,
+    ['fromBalance', 'remainingMonths', 'periods', 'totalInterest', 'totalPayments', 'closesToZero', 'amortizes', 'estimatedPayoffDate', 'rows'],
+    'schedule.projection'
+  );
+
+  const paidRow = schedule.json.schedule.rows.find((row) => row.status === 'PAID');
+  assert.ok(paidRow, 'the recorded EMI must mark a period as paid');
+  assertHasKeys(
+    paidRow,
+    ['period', 'date', 'openingBalance', 'interest', 'principal', 'extraPrincipal', 'emi', 'scheduledEmi', 'totalPayment', 'closingBalance', 'isFinal', 'status', 'actual'],
+    'schedule.rows[]'
+  );
+  assertHasKeys(
+    paidRow.actual,
+    ['totalAmount', 'principalAmount', 'interestAmount', 'extraPrincipal', 'count', 'date', 'paymentIds'],
+    'schedule.rows[].actual'
+  );
+  const forecastRow = schedule.json.schedule.rows.find((row) => row.status === 'FORECAST');
+  assert.equal(forecastRow.actual, null, 'a forecast row must not carry actuals');
+
+  // ---- POST /api/loans/:id/simulate (the simulator) ----------------------
+  const simulation = await api('POST', `/api/loans/${id}/simulate`, {
+    token: tokenA,
+    body: { extraAmount: 100000, newRate: 9.5 },
+  });
+  assertHasKeys(
+    simulation.json.prepayment,
+    ['baseline', 'scenario', 'interestSaved', 'monthsSaved', 'newPayoffDate', 'principalReducedImmediately', 'emiAfter', 'keepEmi', 'closesToZero', 'amortizes'],
+    'simulate.prepayment'
+  );
+  assertHasKeys(simulation.json.prepayment.baseline, ['totalInterest', 'months', 'payoffDate'], 'prepayment.baseline');
+  assertHasKeys(simulation.json.prepayment.scenario, ['totalInterest', 'months', 'payoffDate'], 'prepayment.scenario');
+  assertHasKeys(
+    simulation.json.rateChange,
+    ['newRatePercent', 'changedFrom', 'unaffectedPeriods', 'balanceAtChange', 'newTotalInterest', 'totalInterestDelta', 'newPayoffDate', 'monthsDelta', 'emiForSameTenure', 'baseline'],
+    'simulate.rateChange'
+  );
+
+  await deleteLoanRow(id);
+});
