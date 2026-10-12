@@ -44,6 +44,22 @@ const {
 const {
   authorizeCategory,
 } = require('./lib/authorization');
+const {
+  buildAmortizationSchedule,
+  computePaymentAllocation,
+  outstandingBalance,
+  remainingTenure,
+  prepaymentSavings,
+  rateChangeImpact,
+  summarizeLoan,
+  deriveEmiIfMissing,
+  validateLoanInput,
+  addMonthsClamped,
+  monthsBetween,
+  toPaise,
+  fromPaise,
+  num,
+} = require('./lib/loans');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -5040,6 +5056,1101 @@ app.post(
         error:
           'Failed to confirm pending import.',
       });
+    }
+  }
+);
+
+// ==========================================
+// 13b. LOANS
+// ==========================================
+//
+// Loan Tracker (P0-9). The mathematics lives in src/lib/loans.js; this section
+// is only HTTP plumbing, ownership and persistence.
+//
+// Ownership rule (the P0-8 lesson): `LoanPayment` carries no `userId`, so every
+// payment route resolves the PARENT loan with `{ id, userId: req.user.id }`
+// first and only then looks up the payment by `{ id, loanId }`. A payment id on
+// its own is never trusted, and a loan id on its own is never trusted either.
+//
+// Two invariants this section maintains:
+//   1. Forecasts are never persisted. Schedules, payoff dates and prepayment
+//      savings are computed on demand from src/lib/loans.js.
+//   2. `Loan.currentPrincipal` is always RECOMPUTED from the payment history
+//      rather than incremented, so it cannot drift away from the ledger.
+//
+// Decision A (final): recording a loan payment never creates an `Expense` row.
+// `LoanPayment` is the single source of truth for actual loan payments.
+
+const LOAN_PAYMENT_KINDS = ['EMI', 'PREPAYMENT', 'PART_PAYMENT', 'ADJUSTMENT'];
+
+const loanNotFound = (res) => res.status(404).json({ error: 'Loan not found.' });
+
+/** Date of the final row of a schedule, or null when there is nothing left to pay. */
+const lastScheduleDateOf = (schedule) => {
+  const rows = (schedule && schedule.rows) || [];
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    if (rows[index].date) return rows[index].date;
+  }
+  return null;
+};
+
+const paymentNotFound = (res) => res.status(404).json({ error: 'Payment not found.' });
+
+/** Resolve a loan the caller owns. Never trusts a bare id. */
+const findOwnedLoan = (userId, loanId) =>
+  prisma.loan.findFirst({
+    where: { id: loanId, userId },
+  });
+
+const decimalToNumber = (value) =>
+  value === null || value === undefined ? null : Number(value);
+
+/** Contractual tenure in months when the loan states both dates. */
+const contractualMonths = (loan) => {
+  const months = monthsBetween(loan.startDate, loan.endDate);
+  return months > 0 ? months : null;
+};
+
+/** Never expose raw Decimal objects (they serialise as strings). */
+const serializeLoan = (loan) => ({
+  id: loan.id,
+  name: loan.name,
+  lender: loan.lender,
+  loanType: loan.loanType,
+  originalPrincipal: decimalToNumber(loan.originalPrincipal),
+  currentPrincipal: decimalToNumber(loan.currentPrincipal),
+  interestRate: decimalToNumber(loan.interestRate),
+  emiAmount: decimalToNumber(loan.emiAmount),
+  startDate: loan.startDate,
+  endDate: loan.endDate,
+  emiDay: loan.emiDay,
+  isActive: loan.isActive,
+  paymentAccountId: loan.paymentAccountId,
+  createdAt: loan.createdAt,
+  updatedAt: loan.updatedAt,
+});
+
+const serializePayment = (payment) => ({
+  id: payment.id,
+  loanId: payment.loanId,
+  date: payment.date,
+  totalAmount: decimalToNumber(payment.totalAmount),
+  principalAmount: decimalToNumber(payment.principalAmount),
+  interestAmount: decimalToNumber(payment.interestAmount),
+  extraPrincipal: decimalToNumber(payment.extraPrincipal),
+  outstandingAfter: decimalToNumber(payment.outstandingAfter),
+  note: payment.note,
+  createdAt: payment.createdAt,
+});
+
+/** An optional paymentAccountId must belong to the caller. */
+const ownedAccountExists = async (userId, accountId) => {
+  if (!accountId) return true;
+  const account = await prisma.account.findFirst({
+    where: { id: accountId, userId },
+    select: { id: true },
+  });
+  return Boolean(account);
+};
+
+/**
+ * Recompute every `outstandingAfter` and the loan's `currentPrincipal` from the
+ * immutable ledger, oldest payment first.
+ *
+ * The starting balance is recovered from the FIRST payment
+ * (`outstandingAfter + principal + extra`), which preserves a loan imported
+ * mid-term: such a loan opens below its original principal and the ledger anchor
+ * must stay there. With no payments at all the loan simply sits at its original
+ * principal.
+ */
+const ledgerAnchorPaise = (loan, orderedPayments) => {
+  const first = orderedPayments.length > 0 ? orderedPayments[0] : null;
+  if (!first || first.outstandingAfter === null || first.outstandingAfter === undefined) {
+    return toPaise(loan.originalPrincipal);
+  }
+  // outstandingAfter = opening - principal - extra, so this sum IS the opening
+  // balance the ledger started from. It is algebraically invariant under
+  // resync, which is what makes recomputation safe to repeat.
+  return toPaise(first.outstandingAfter) + toPaise(first.principalAmount) + toPaise(first.extraPrincipal);
+};
+
+/**
+ * The balance immediately BEFORE a payment dated `cutover`.
+ *
+ * Only payments that precede it may reduce the balance. Subtracting a LATER
+ * payment's principal (which `outstandingBalance` does, since it sums the whole
+ * history) would compute the opening balance for the wrong point in the ledger
+ * and produce a split for an impossible balance.
+ *
+ * `orderedPayments` must be the FULL ledger, oldest first, INCLUDING `excludeId`.
+ * The anchor is read from the first row, and `outstandingAfter + principal +
+ * extra` is algebraically invariant under a change to that row's own split, so
+ * this stays correct even while the first payment is being edited. Reading the
+ * anchor from a list that already had the edited row removed would instead
+ * recover the opening balance of whichever row became first — a real defect that
+ * produced a split for an impossible balance.
+ *
+ * @param {object} loan
+ * @param {Array} orderedPayments every existing payment, oldest first
+ * @param {Date} cutover when the payment being computed takes effect
+ * @param {string|null} excludeId a payment to ignore when summing (the row being edited)
+ */
+const openingBalanceBefore = (loan, orderedPayments, cutover, excludeId = null) => {
+  const cutoverMs = new Date(cutover).getTime();
+  let reductionPaise = 0;
+
+  for (const payment of orderedPayments) {
+    if (excludeId !== null && payment.id === excludeId) continue;
+    if (new Date(payment.date).getTime() < cutoverMs) {
+      reductionPaise += toPaise(payment.principalAmount) + toPaise(payment.extraPrincipal);
+    }
+  }
+
+  return fromPaise(Math.max(0, ledgerAnchorPaise(loan, orderedPayments) - reductionPaise));
+};
+
+const resyncLoanLedger = async (loan, client = prisma) => {
+  const payments = await client.loanPayment.findMany({
+    where: { loanId: loan.id },
+    orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+  });
+
+  if (payments.length === 0) {
+    const currentPrincipal = Number(loan.originalPrincipal);
+    if (toPaise(loan.currentPrincipal) !== toPaise(currentPrincipal)) {
+      await client.loan.update({ where: { id: loan.id }, data: { currentPrincipal } });
+    }
+    return { payments, currentPrincipal };
+  }
+
+  let balancePaise = ledgerAnchorPaise(loan, payments);
+
+  for (const payment of payments) {
+    balancePaise -= toPaise(payment.principalAmount) + toPaise(payment.extraPrincipal);
+    if (balancePaise < 0) balancePaise = 0;
+    const outstandingAfter = fromPaise(balancePaise);
+    if (toPaise(payment.outstandingAfter) !== toPaise(outstandingAfter)) {
+      await client.loanPayment.update({
+        where: { id: payment.id },
+        data: { outstandingAfter },
+      });
+      payment.outstandingAfter = outstandingAfter;
+    }
+  }
+
+  const currentPrincipal = fromPaise(balancePaise);
+  if (toPaise(loan.currentPrincipal) !== toPaise(currentPrincipal)) {
+    await client.loan.update({ where: { id: loan.id }, data: { currentPrincipal } });
+  }
+
+  return { payments, currentPrincipal };
+};
+
+/** The next EMI due date, or null when the loan does not state a day. */
+const nextEmiDateFor = (loan, payments = []) => {
+  if (loan.isActive === false) return null;
+  const start = loan.startDate ? new Date(loan.startDate) : null;
+  const day = loan.emiDay || (start ? start.getDate() : null);
+  if (!day) return null;
+
+  const now = new Date();
+  const lastPaid = payments.length ? new Date(payments[payments.length - 1].date) : null;
+  const from = lastPaid && lastPaid.getTime() > now.getTime() ? lastPaid : now;
+
+  const lastDayThisMonth = new Date(from.getFullYear(), from.getMonth() + 1, 0).getDate();
+  const thisMonth = new Date(from.getFullYear(), from.getMonth(), Math.min(day, lastDayThisMonth));
+  if (thisMonth.getTime() > from.getTime()) return thisMonth;
+  return addMonthsClamped(thisMonth, 1);
+};
+
+/**
+ * Attach actual payments to the periods of a lifetime schedule.
+ * A row is PAID / PARTIAL / FORECAST, so the UI can style history and forecast
+ * differently without a second source of truth.
+ */
+const annotateSchedule = (rows, payments) => {
+  if (rows.length === 0) return [];
+
+  const buckets = rows.map(() => []);
+  for (const payment of payments) {
+    const when = new Date(payment.date).getTime();
+    // A payment belongs to the period it falls INSIDE: the last due date that is
+    // not after the payment. A payment made before the first due date (an
+    // up-front prepayment) is charged to period 1.
+    let index = 0;
+    for (let row = 0; row < rows.length; row += 1) {
+      if (rows[row].date && new Date(rows[row].date).getTime() <= when) index = row;
+    }
+    buckets[index].push(payment);
+  }
+
+  return rows.map((row, index) => {
+    const group = buckets[index];
+    if (group.length === 0) {
+      return { ...row, status: 'FORECAST', actual: null };
+    }
+
+    const sum = (key) => group.reduce((total, p) => total + toPaise(p[key]), 0);
+    const actualPrincipal = sum('principalAmount');
+    const actualExtra = sum('extraPrincipal');
+    const actualInterest = sum('interestAmount');
+    const plannedPaise = toPaise(row.principal) + toPaise(row.extraPrincipal);
+    const paidPaise = actualPrincipal + actualExtra;
+
+    return {
+      ...row,
+      status: paidPaise >= plannedPaise && plannedPaise > 0 ? 'PAID' : paidPaise > 0 ? 'PARTIAL' : 'UNPAID',
+      actual: {
+        totalAmount: fromPaise(sum('totalAmount')),
+        principalAmount: fromPaise(actualPrincipal),
+        interestAmount: fromPaise(actualInterest),
+        extraPrincipal: fromPaise(actualExtra),
+        count: group.length,
+        date: group[group.length - 1].date,
+        paymentIds: group.map((p) => p.id),
+      },
+    };
+  });
+};
+
+/** Loan + payments, in the shape every read route returns. */
+const loadLoanContext = async (userId, loanId) => {
+  const loan = await findOwnedLoan(userId, loanId);
+  if (!loan) return null;
+
+  const payments = await prisma.loanPayment.findMany({
+    where: { loanId: loan.id },
+    orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+  });
+
+  return { loan, payments };
+};
+
+// ---- list ----------------------------------------------------------------
+
+app.get(
+  '/api/loans',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const loans = await prisma.loan.findMany({
+        where: { userId: req.user.id },
+        orderBy: [{ isActive: 'desc' }, { createdAt: 'desc' }],
+        include: { payments: { orderBy: [{ date: 'asc' }, { createdAt: 'asc' }] } },
+      });
+
+      const activeFilter = req.query.active;
+      const filtered = activeFilter === undefined
+        ? loans
+        : loans.filter((loan) => String(loan.isActive) === String(activeFilter));
+
+      res.json(
+        filtered.map((loan) => ({
+          ...serializeLoan(loan),
+          summary: summarizeLoan(loan, loan.payments),
+          nextEmiDate: nextEmiDateFor(loan, loan.payments),
+        }))
+      );
+    } catch (error) {
+      console.error('Fetch loans error:', error);
+      res.status(500).json({ error: 'Failed to fetch loans.' });
+    }
+  }
+);
+
+// ---- create --------------------------------------------------------------
+
+app.post(
+  '/api/loans',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const validation = validateLoanInput(req.body, { requireAll: true });
+      if (!validation.ok) {
+        return res.status(400).json({ error: validation.errors[0], errors: validation.errors });
+      }
+
+      const input = validation.value;
+
+      if (!(await ownedAccountExists(req.user.id, input.paymentAccountId))) {
+        return res.status(400).json({ error: 'Payment account not found.' });
+      }
+
+      const originalPrincipal = input.originalPrincipal;
+      const currentPrincipal =
+        input.currentPrincipal === undefined ? originalPrincipal : input.currentPrincipal;
+
+      if (currentPrincipal > originalPrincipal) {
+        return res.status(400).json({
+          error: 'Current principal cannot exceed the original principal.',
+        });
+      }
+
+      const interestRate = input.interestRate === undefined ? 0 : input.interestRate;
+
+      // Fill in a missing EMI from the stated tenure, rounding UP so the derived
+      // instalment actually clears that tenure instead of landing one period late.
+      const emiAmount =
+        input.emiAmount === undefined || input.emiAmount === null
+          ? deriveEmiIfMissing({
+              originalPrincipal,
+              interestRate,
+              startDate: input.startDate,
+              endDate: input.endDate,
+            })
+          : input.emiAmount;
+
+      // An EMI without an end date still implies one; derive it so the schedule
+      // has a contractual tenure to close against.
+      let endDate = input.endDate ?? null;
+      if (!endDate && input.startDate && emiAmount) {
+        const months = remainingTenure(currentPrincipal, interestRate, emiAmount);
+        if (months && months > 0) endDate = addMonthsClamped(input.startDate, months);
+      }
+
+      const loan = await prisma.loan.create({
+        data: {
+          name: input.name,
+          lender: input.lender ?? null,
+          loanType: input.loanType ?? 'HOME_LOAN',
+          originalPrincipal,
+          currentPrincipal,
+          interestRate,
+          emiAmount: emiAmount ?? null,
+          startDate: input.startDate ?? null,
+          endDate,
+          emiDay: input.emiDay ?? null,
+          isActive: input.isActive === undefined ? true : input.isActive,
+          paymentAccountId: input.paymentAccountId ?? null,
+          userId: req.user.id,
+        },
+      });
+
+      res.status(201).json({
+        ...serializeLoan(loan),
+        summary: summarizeLoan(loan, []),
+        nextEmiDate: nextEmiDateFor(loan, []),
+      });
+    } catch (error) {
+      console.error('Create loan error:', error);
+      res.status(500).json({ error: 'Failed to create loan.' });
+    }
+  }
+);
+
+// ---- detail --------------------------------------------------------------
+
+app.get(
+  '/api/loans/:id',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const context = await loadLoanContext(req.user.id, req.params.id);
+      if (!context) return loanNotFound(res);
+
+      const { loan, payments } = context;
+      res.json({
+        ...serializeLoan(loan),
+        summary: summarizeLoan(loan, payments),
+        nextEmiDate: nextEmiDateFor(loan, payments),
+        payments: payments.map(serializePayment),
+      });
+    } catch (error) {
+      console.error('Fetch loan error:', error);
+      res.status(500).json({ error: 'Failed to fetch loan.' });
+    }
+  }
+);
+
+// ---- update --------------------------------------------------------------
+
+app.put(
+  '/api/loans/:id',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const existing = await findOwnedLoan(req.user.id, req.params.id);
+      if (!existing) return loanNotFound(res);
+
+      const validation = validateLoanInput(req.body, { requireAll: false });
+      if (!validation.ok) {
+        return res.status(400).json({ error: validation.errors[0], errors: validation.errors });
+      }
+
+      const input = validation.value;
+      const updates = { ...input };
+
+      if (input.paymentAccountId !== undefined && !(await ownedAccountExists(req.user.id, input.paymentAccountId))) {
+        return res.status(400).json({ error: 'Payment account not found.' });
+      }
+
+      const nextOriginal =
+        input.originalPrincipal === undefined ? Number(existing.originalPrincipal) : input.originalPrincipal;
+      const nextRate =
+        input.interestRate === undefined ? Number(existing.interestRate ?? 0) : input.interestRate;
+
+      const payments = await prisma.loanPayment.findMany({
+        where: { loanId: existing.id },
+        orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+      });
+
+      if (input.currentPrincipal !== undefined) {
+        updates.currentPrincipal = input.currentPrincipal;
+      } else if (payments.length > 0) {
+        // History exists: the ledger decides the balance, not the request body.
+        updates.currentPrincipal = outstandingBalance(
+          { originalPrincipal: nextOriginal },
+          payments
+        );
+      } else if (input.originalPrincipal !== undefined && nextOriginal !== Number(existing.originalPrincipal)) {
+        updates.currentPrincipal = nextOriginal;
+      }
+
+      if (updates.currentPrincipal !== undefined && updates.currentPrincipal > nextOriginal) {
+        return res.status(400).json({
+          error: 'Current principal cannot exceed the original principal.',
+        });
+      }
+
+      // Keep the implied end date in step when the tenure inputs changed.
+      if (updates.endDate === undefined && input.startDate !== undefined && !existing.endDate) {
+        const emi = input.emiAmount === undefined ? Number(existing.emiAmount ?? 0) : input.emiAmount;
+        if (emi > 0 && input.startDate) {
+          const months = remainingTenure(updates.currentPrincipal ?? Number(existing.currentPrincipal), nextRate, emi);
+          if (months && months > 0) updates.endDate = addMonthsClamped(input.startDate, months);
+        }
+      }
+
+      const loan = await prisma.loan.update({ where: { id: existing.id }, data: updates });
+
+      res.json({
+        ...serializeLoan(loan),
+        summary: summarizeLoan(loan, payments),
+        nextEmiDate: nextEmiDateFor(loan, payments),
+      });
+    } catch (error) {
+      console.error('Update loan error:', error);
+      res.status(500).json({ error: 'Failed to update loan.' });
+    }
+  }
+);
+
+// ---- toggle + delete -----------------------------------------------------
+
+app.patch(
+  '/api/loans/:id/toggle',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const existing = await findOwnedLoan(req.user.id, req.params.id);
+      if (!existing) return loanNotFound(res);
+
+      const loan = await prisma.loan.update({
+        where: { id: existing.id },
+        data: { isActive: !existing.isActive },
+      });
+
+      const payments = await prisma.loanPayment.findMany({
+        where: { loanId: loan.id },
+        orderBy: [{ date: 'asc' }],
+      });
+
+      res.json({
+        ...serializeLoan(loan),
+        summary: summarizeLoan(loan, payments),
+      });
+    } catch (error) {
+      console.error('Toggle loan error:', error);
+      res.status(500).json({ error: 'Failed to update loan.' });
+    }
+  }
+);
+
+app.delete(
+  '/api/loans/:id',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const existing = await findOwnedLoan(req.user.id, req.params.id);
+      if (!existing) return loanNotFound(res);
+
+      // LoanPayment has onDelete: Cascade, so the ledger goes with the loan.
+      await prisma.loan.delete({ where: { id: existing.id } });
+
+      res.json({ message: 'Loan deleted.', id: existing.id });
+    } catch (error) {
+      console.error('Delete loan error:', error);
+      res.status(500).json({ error: 'Failed to delete loan.' });
+    }
+  }
+);
+
+// ---- payments: history, record, edit, delete -----------------------------
+
+app.get(
+  '/api/loans/:id/payments',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const context = await loadLoanContext(req.user.id, req.params.id);
+      if (!context) return loanNotFound(res);
+
+      const { loan, payments } = context;
+      let totalInterest = 0;
+      let totalPrincipal = 0;
+      let totalExtra = 0;
+      let totalPaid = 0;
+
+      for (const payment of payments) {
+        totalInterest += toPaise(payment.interestAmount);
+        totalPrincipal += toPaise(payment.principalAmount);
+        totalExtra += toPaise(payment.extraPrincipal);
+        totalPaid += toPaise(payment.totalAmount);
+      }
+
+      res.json({
+        loanId: loan.id,
+        count: payments.length,
+        totals: {
+          totalPaid: fromPaise(totalPaid),
+          totalPrincipal: fromPaise(totalPrincipal),
+          totalExtra: fromPaise(totalExtra),
+          totalInterest: fromPaise(totalInterest),
+        },
+        outstandingPrincipal: outstandingBalance(loan, payments),
+        payments: payments.map(serializePayment),
+      });
+    } catch (error) {
+      console.error('Fetch loan payments error:', error);
+      res.status(500).json({ error: 'Failed to fetch payment history.' });
+    }
+  }
+);
+
+app.post(
+  '/api/loans/:id/payments',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const loan = await findOwnedLoan(req.user.id, req.params.id);
+      if (!loan) return loanNotFound(res);
+
+      const body = req.body || {};
+      const rawKind = String(body.kind || 'EMI').toUpperCase();
+      if (!LOAN_PAYMENT_KINDS.includes(rawKind)) {
+        return res.status(400).json({
+          error: `Invalid payment kind. Expected one of: ${LOAN_PAYMENT_KINDS.join(', ')}.`,
+        });
+      }
+
+      const amount = num(body.amount === undefined ? body.totalAmount : body.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ error: 'Payment amount must be greater than zero.' });
+      }
+
+      const date = body.date === undefined ? new Date() : new Date(body.date);
+      if (Number.isNaN(date.getTime())) {
+        return res.status(400).json({ error: 'Payment date is not a valid date.' });
+      }
+
+      const note = body.note === undefined || body.note === null ? null : String(body.note).slice(0, 500);
+
+      const result = await prisma.$transaction(async (db) => {
+        const history = await db.loanPayment.findMany({
+          where: { loanId: loan.id },
+          orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+        });
+
+        const opening = openingBalanceBefore(loan, history, date);
+
+        const allocation = computePaymentAllocation({
+          openingBalance: opening,
+          annualRatePercent: loan.interestRate ?? 0,
+          amount,
+          // An ADJUSTMENT is a labelled part-payment: principal only, no interest.
+          kind: rawKind === 'ADJUSTMENT' ? 'PREPAYMENT' : rawKind,
+          note,
+          date,
+        });
+
+        if (!allocation.ok) return { error: allocation.error };
+
+        let principalAmount = allocation.principalAmount;
+        let interestAmount = allocation.interestAmount;
+        let extraPrincipal = allocation.extraPrincipal;
+
+        // The user may supply the split explicitly (the checkpoint allows it),
+        // but it must reconcile against the total and against the balance.
+        const explicitSplit = ['principalAmount', 'interestAmount', 'extraPrincipal'].some(
+          (key) => body[key] !== undefined && body[key] !== null
+        );
+
+        if (explicitSplit) {
+          const p = num(body.principalAmount);
+          const i = num(body.interestAmount);
+          const e = num(body.extraPrincipal);
+          if (![p, i, e].every((value) => Number.isFinite(value) && value >= 0)) {
+            return { error: 'Payment split amounts must be non-negative numbers.' };
+          }
+          // Reject an impossible balance before arguing about the split.
+          if (toPaise(p) + toPaise(e) > toPaise(opening)) {
+            return { error: 'Payment would drive the outstanding balance below zero.' };
+          }
+          if (toPaise(p) + toPaise(i) + toPaise(e) !== toPaise(allocation.totalAmount)) {
+            return { error: 'The payment split must add up to the total amount.' };
+          }
+          principalAmount = fromPaise(toPaise(p));
+          interestAmount = fromPaise(toPaise(i));
+          extraPrincipal = fromPaise(toPaise(e));
+        }
+
+        const outstandingAfter = fromPaise(
+          Math.max(0, toPaise(opening) - toPaise(principalAmount) - toPaise(extraPrincipal))
+        );
+
+        const payment = await db.loanPayment.create({
+          data: {
+            loanId: loan.id,
+            date,
+            totalAmount: fromPaise(toPaise(principalAmount) + toPaise(interestAmount) + toPaise(extraPrincipal)),
+            principalAmount,
+            interestAmount,
+            extraPrincipal,
+            outstandingAfter,
+            note,
+          },
+        });
+
+        const updatedLoan = await db.loan.update({
+          where: { id: loan.id },
+          data: {
+            currentPrincipal: outstandingAfter,
+            // A loan with no stated start date takes it from its first payment.
+            ...(loan.startDate ? {} : { startDate: date }),
+          },
+        });
+
+        return { payment, loan: updatedLoan };
+      });
+
+      if (result.error) return res.status(400).json({ error: result.error });
+
+      // A back-dated payment can change the running balance of the rows after it;
+      // resync the chain so outstandingAfter and currentPrincipal stay exact.
+      await resyncLoanLedger(loan);
+      const updatedLoan = await prisma.loan.findUnique({ where: { id: loan.id } });
+      const payments = await prisma.loanPayment.findMany({
+        where: { loanId: loan.id },
+        orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+      });
+
+      res.status(201).json({
+        payment: serializePayment(payments.find((p) => p.id === result.payment.id) || result.payment),
+        loan: serializeLoan(updatedLoan),
+        summary: summarizeLoan(updatedLoan, payments),
+      });
+    } catch (error) {
+      console.error('Record loan payment error:', error);
+      res.status(500).json({ error: 'Failed to record payment.' });
+    }
+  }
+);
+
+app.put(
+  '/api/loans/:id/payments/:paymentId',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const loan = await findOwnedLoan(req.user.id, req.params.id);
+      if (!loan) return loanNotFound(res);
+
+      const existing = await prisma.loanPayment.findFirst({
+        where: { id: req.params.paymentId, loanId: loan.id },
+      });
+      if (!existing) return paymentNotFound(res);
+
+      const body = req.body || {};
+      const rawKind = body.kind === undefined ? null : String(body.kind).toUpperCase();
+      if (rawKind !== null && !LOAN_PAYMENT_KINDS.includes(rawKind)) {
+        return res.status(400).json({
+          error: `Invalid payment kind. Expected one of: ${LOAN_PAYMENT_KINDS.join(', ')}.`,
+        });
+      }
+
+      const date = body.date === undefined ? new Date(existing.date) : new Date(body.date);
+      if (Number.isNaN(date.getTime())) {
+        return res.status(400).json({ error: 'Payment date is not a valid date.' });
+      }
+
+      const amount = num(
+        body.amount === undefined ? (body.totalAmount === undefined ? existing.totalAmount : body.totalAmount) : body.amount
+      );
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ error: 'Payment amount must be greater than zero.' });
+      }
+
+      const note =
+        body.note === undefined
+          ? existing.note
+          : body.note === null
+            ? null
+            : String(body.note).slice(0, 500);
+
+      const result = await prisma.$transaction(async (db) => {
+        // Re-derive the opening balance WITHOUT this payment's own effect, so
+        // editing a row cannot compound itself. The full ledger is still needed
+        // to recover the loan's opening anchor.
+        const ledger = await db.loanPayment.findMany({
+          where: { loanId: loan.id },
+          orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+        });
+
+        const opening = openingBalanceBefore(loan, ledger, date, existing.id);
+
+        const allocation = computePaymentAllocation({
+          openingBalance: opening,
+          annualRatePercent: loan.interestRate ?? 0,
+          amount,
+          kind: (rawKind || 'EMI') === 'ADJUSTMENT' ? 'PREPAYMENT' : rawKind || 'EMI',
+          note,
+          date,
+        });
+
+        if (!allocation.ok) return { error: allocation.error };
+
+        const payment = await db.loanPayment.update({
+          where: { id: existing.id },
+          data: {
+            date,
+            totalAmount: allocation.totalAmount,
+            principalAmount: allocation.principalAmount,
+            interestAmount: allocation.interestAmount,
+            extraPrincipal: allocation.extraPrincipal,
+            outstandingAfter: allocation.outstandingAfter,
+            note,
+          },
+        });
+
+        return { payment };
+      });
+
+      if (result.error) return res.status(400).json({ error: result.error });
+
+      const { currentPrincipal } = await resyncLoanLedger(loan);
+      const updatedLoan = await prisma.loan.findUnique({ where: { id: loan.id } });
+      const payments = await prisma.loanPayment.findMany({
+        where: { loanId: loan.id },
+        orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+      });
+
+      res.json({
+        payment: serializePayment(result.payment),
+        loan: serializeLoan(updatedLoan),
+        summary: summarizeLoan({ ...updatedLoan, currentPrincipal }, payments),
+      });
+    } catch (error) {
+      console.error('Update loan payment error:', error);
+      res.status(500).json({ error: 'Failed to update payment.' });
+    }
+  }
+);
+
+app.delete(
+  '/api/loans/:id/payments/:paymentId',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const loan = await findOwnedLoan(req.user.id, req.params.id);
+      if (!loan) return loanNotFound(res);
+
+      const existing = await prisma.loanPayment.findFirst({
+        where: { id: req.params.paymentId, loanId: loan.id },
+      });
+      if (!existing) return paymentNotFound(res);
+
+      await prisma.loanPayment.delete({ where: { id: existing.id } });
+      await resyncLoanLedger(loan);
+
+      const updatedLoan = await prisma.loan.findUnique({ where: { id: loan.id } });
+      const payments = await prisma.loanPayment.findMany({
+        where: { loanId: loan.id },
+        orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+      });
+
+      res.json({
+        message: 'Payment deleted.',
+        id: existing.id,
+        loan: serializeLoan(updatedLoan),
+        summary: summarizeLoan(updatedLoan, payments),
+      });
+    } catch (error) {
+      console.error('Delete loan payment error:', error);
+      res.status(500).json({ error: 'Failed to delete payment.' });
+    }
+  }
+);
+
+// ---- computed: summary, schedule, simulate, adjust ----------------------
+
+app.get(
+  '/api/loans/:id/summary',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const context = await loadLoanContext(req.user.id, req.params.id);
+      if (!context) return loanNotFound(res);
+
+      const { loan, payments } = context;
+      const summary = summarizeLoan(loan, payments);
+
+      res.json({
+        ...summary,
+        nextEmiDate: nextEmiDateFor(loan, payments),
+        contractualMonths: contractualMonths(loan),
+        scheduledEmi: loan.emiAmount === null ? null : Number(loan.emiAmount),
+      });
+    } catch (error) {
+      console.error('Fetch loan summary error:', error);
+      res.status(500).json({ error: 'Failed to fetch loan summary.' });
+    }
+  }
+);
+
+app.get(
+  '/api/loans/:id/schedule',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const context = await loadLoanContext(req.user.id, req.params.id);
+      if (!context) return loanNotFound(res);
+
+      const { loan, payments } = context;
+      const rate = Number(loan.interestRate ?? 0);
+      const emi = Number(loan.emiAmount ?? 0);
+      const outstanding = outstandingBalance(loan, payments);
+      const months = contractualMonths(loan);
+
+      // The loan's whole life, with actual payments marked against each period.
+      const lifetime = buildAmortizationSchedule({
+        principal: Number(loan.originalPrincipal),
+        annualRatePercent: rate,
+        emi,
+        startDate: loan.startDate,
+        periods: months,
+      });
+
+      // What is still to come, rebuilt from the CURRENT balance so every actual
+      // prepayment is already reflected in the projection.
+      const remainingMonths = emi > 0 ? remainingTenure(outstanding, rate, emi) : null;
+      const projection = emi > 0 && outstanding > 0
+        ? buildAmortizationSchedule({
+            principal: outstanding,
+            annualRatePercent: rate,
+            emi,
+            startDate: nextEmiDateFor(loan, payments) || new Date(),
+            periods: remainingMonths,
+          })
+        : buildAmortizationSchedule({ principal: 0, annualRatePercent: rate, emi, startDate: null });
+
+      res.json({
+        loan: serializeLoan(loan),
+        summary: summarizeLoan(loan, payments),
+        contractualMonths: months,
+        scheduledEmi: loan.emiAmount === null ? null : Number(loan.emiAmount),
+        schedule: {
+          rows: annotateSchedule(lifetime.rows, payments),
+          planned: {
+            periods: lifetime.periods,
+            totalInterest: lifetime.totalInterest,
+            totalPrincipal: lifetime.totalPrincipal,
+            totalExtra: lifetime.totalExtra,
+            totalPayments: lifetime.totalPayments,
+            closesToZero: lifetime.closesToZero,
+            amortizes: lifetime.amortizes,
+          },
+          actualTotals: {
+            count: payments.length,
+            totalPaid: fromPaise(payments.reduce((total, p) => total + toPaise(p.totalAmount), 0)),
+            totalInterest: fromPaise(payments.reduce((total, p) => total + toPaise(p.interestAmount), 0)),
+            totalPrincipal: fromPaise(payments.reduce((total, p) => total + toPaise(p.principalAmount), 0)),
+            totalExtra: fromPaise(payments.reduce((total, p) => total + toPaise(p.extraPrincipal), 0)),
+          },
+        },
+        projection: {
+          fromBalance: outstanding,
+          remainingMonths,
+          periods: projection.periods,
+          totalInterest: projection.totalInterest,
+          totalPayments: projection.totalPayments,
+          closesToZero: projection.closesToZero,
+          amortizes: projection.amortizes,
+          estimatedPayoffDate: lastScheduleDateOf(projection),
+          rows: projection.rows,
+        },
+      });
+    } catch (error) {
+      console.error('Fetch loan schedule error:', error);
+      res.status(500).json({ error: 'Failed to fetch amortization schedule.' });
+    }
+  }
+);
+
+app.post(
+  '/api/loans/:id/simulate',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const context = await loadLoanContext(req.user.id, req.params.id);
+      if (!context) return loanNotFound(res);
+
+      const { loan, payments } = context;
+      const body = req.body || {};
+      const rate = Number(loan.interestRate ?? 0);
+      const emi = Number(loan.emiAmount ?? 0);
+      const outstanding = outstandingBalance(loan, payments);
+
+      const extraAmount = num(body.extraAmount);
+      const monthlyExtra = num(body.monthlyExtra);
+      const keepEmi = body.keepEmi === undefined ? true : Boolean(body.keepEmi);
+
+      if (!Number.isFinite(extraAmount) || extraAmount < 0) {
+        return res.status(400).json({ error: 'extraAmount must be a non-negative number.' });
+      }
+      if (!Number.isFinite(monthlyExtra) || monthlyExtra < 0) {
+        return res.status(400).json({ error: 'monthlyExtra must be a non-negative number.' });
+      }
+
+      if (emi <= 0) {
+        return res.status(400).json({
+          error: 'A payoff simulation needs an EMI. Set the loan EMI first.',
+        });
+      }
+
+      // Decision B: the default scenario keeps the EMI and shortens the tenure.
+      const prepayment = prepaymentSavings({
+        principal: Number(loan.originalPrincipal),
+        annualRatePercent: rate,
+        emi,
+        startDate: loan.startDate,
+        currentBalance: outstanding,
+        extraAmount,
+        monthlyExtra,
+        keepEmi,
+        fromDate: nextEmiDateFor(loan, payments) || new Date(),
+        periods: remainingTenure(outstanding, rate, emi),
+      });
+
+      let rateChange = null;
+      if (body.newRate !== undefined && body.newRate !== null && body.newRate !== '') {
+        const newRate = num(body.newRate);
+        if (!Number.isFinite(newRate) || newRate < 0 || newRate > 100) {
+          return res.status(400).json({ error: 'newRate must be between 0 and 100.' });
+        }
+        rateChange = rateChangeImpact({
+          originalPrincipal: Number(loan.originalPrincipal),
+          annualRatePercent: rate,
+          emi,
+          startDate: loan.startDate,
+          newRatePercent: newRate,
+          fromPeriod: Number(body.fromPeriod ?? payments.length + 1) || payments.length + 1,
+        });
+        rateChange = {
+          newRatePercent: newRate,
+          changedFrom: rateChange.changedFrom,
+          unaffectedPeriods: rateChange.unaffectedPeriods,
+          balanceAtChange: rateChange.balanceAtChange,
+          newTotalInterest: rateChange.newTotalInterest,
+          totalInterestDelta: rateChange.totalInterestDelta,
+          newPayoffDate: rateChange.newPayoffDate,
+          monthsDelta: rateChange.monthsDelta,
+          emiForSameTenure: rateChange.emiForSameTenure,
+          baseline: rateChange.baseline,
+          rows: rateChange.rows,
+        };
+      }
+
+      res.json({
+        loan: serializeLoan(loan),
+        summary: summarizeLoan(loan, payments),
+        input: { extraAmount, monthlyExtra, keepEmi, newRate: body.newRate ?? null },
+        prepayment,
+        rateChange,
+      });
+    } catch (error) {
+      console.error('Simulate loan error:', error);
+      res.status(500).json({ error: 'Failed to simulate the loan.' });
+    }
+  }
+);
+
+app.post(
+  '/api/loans/:id/adjust',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const loan = await findOwnedLoan(req.user.id, req.params.id);
+      if (!loan) return loanNotFound(res);
+
+      const amount = num(req.body?.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ error: 'Adjustment amount must be greater than zero.' });
+      }
+
+      const date = req.body?.date === undefined ? new Date() : new Date(req.body.date);
+      if (Number.isNaN(date.getTime())) {
+        return res.status(400).json({ error: 'Adjustment date is not a valid date.' });
+      }
+
+      const note =
+        req.body?.note === undefined || req.body.note === null
+          ? 'Manual balance adjustment'
+          : String(req.body.note).slice(0, 500);
+
+      const history = await prisma.loanPayment.findMany({
+        where: { loanId: loan.id },
+        orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+      });
+
+      const opening = openingBalanceBefore(loan, history, date);
+      const allocation = computePaymentAllocation({
+        openingBalance: opening,
+        annualRatePercent: loan.interestRate ?? 0,
+        amount,
+        kind: 'PREPAYMENT',
+        note,
+        date,
+      });
+
+      if (!allocation.ok) return res.status(400).json({ error: allocation.error });
+
+      const payment = await prisma.loanPayment.create({
+        data: {
+          loanId: loan.id,
+          date,
+          totalAmount: allocation.totalAmount,
+          principalAmount: allocation.principalAmount,
+          interestAmount: allocation.interestAmount,
+          extraPrincipal: allocation.extraPrincipal,
+          outstandingAfter: allocation.outstandingAfter,
+          note,
+        },
+      });
+
+      await resyncLoanLedger(loan);
+      const updatedLoan = await prisma.loan.findUnique({ where: { id: loan.id } });
+      const payments = await prisma.loanPayment.findMany({
+        where: { loanId: loan.id },
+        orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+      });
+
+      res.status(201).json({
+        payment: serializePayment(payments.find((p) => p.id === payment.id) || payment),
+        loan: serializeLoan(updatedLoan),
+        summary: summarizeLoan(updatedLoan, payments),
+      });
+    } catch (error) {
+      console.error('Adjust loan balance error:', error);
+      res.status(500).json({ error: 'Failed to adjust the loan balance.' });
     }
   }
 );
