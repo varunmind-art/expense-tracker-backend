@@ -5167,6 +5167,14 @@ const serializePayment = (payment) => ({
   extraPrincipal: decimalToNumber(payment.extraPrincipal),
   outstandingAfter: decimalToNumber(payment.outstandingAfter),
   note: payment.note,
+  // Provenance and confirmation. `allocationVerified` is false whenever the bank
+  // did not disclose a principal/interest split, so a consumer can never mistake
+  // a zero split for a verified one.
+  source: payment.source ?? 'MANUAL',
+  status: payment.status ?? 'CONFIRMED',
+  allocationVerified: payment.allocationVerified ?? true,
+  externalRef: payment.externalRef ?? null,
+  scheduledDate: payment.scheduledDate ?? null,
   createdAt: payment.createdAt,
 });
 
