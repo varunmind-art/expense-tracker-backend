@@ -614,6 +614,18 @@ const computePaymentAllocation = ({
  * de-duplicated by `id` first, so passing the same row twice (a join, a retry)
  * cannot double-count it.
  */
+/**
+ * Only settled money counts towards a balance.
+ *
+ * A SCHEDULED row is an assumption that a deduction will happen and a REJECTED
+ * row is a booking error. Neither is money that has moved, so neither may reduce
+ * principal or pay off an instalment.
+ */
+const countsTowardBalance = (payment) => {
+  const status = String((payment && payment.status) || 'CONFIRMED').toUpperCase();
+  return status !== 'SCHEDULED' && status !== 'REJECTED';
+};
+
 const sumPrincipalRepaid = (payments = [], asOfDate = null) => {
   const cutoff = asOfDate ? asDate(asOfDate) : null;
   const seen = new Set();
@@ -621,6 +633,7 @@ const sumPrincipalRepaid = (payments = [], asOfDate = null) => {
 
   for (const payment of payments || []) {
     if (!payment) continue;
+    if (!countsTowardBalance(payment)) continue;
     const id = payment.id ?? null;
     if (id !== null) {
       if (seen.has(id)) continue;
@@ -650,6 +663,7 @@ const outstandingBalance = (loan = {}, payments = [], asOfDate = null) => {
 
   const relevant = (payments || []).filter((p) => {
     if (!p) return false;
+    if (!countsTowardBalance(p)) return false;
     if (!asOfDate) return true;
     const when = asDate(p.date);
     return when && when.getTime() <= asDate(asOfDate).getTime();
@@ -940,7 +954,11 @@ const summarizeLoan = (loan = {}, payments = [], { asOf = null } = {}) => {
   const outstanding = outstandingBalance(loan, payments);
   const repaid = fromPaise(Math.max(0, toPaise(original) - toPaise(outstanding)));
 
-  const sorted = [...(payments || [])].filter(Boolean).sort(
+  const allPayments = [...(payments || [])].filter(Boolean);
+  const settledPayments = allPayments.filter(countsTowardBalance);
+  const pendingPayments = allPayments.filter((p) => !countsTowardBalance(p));
+
+  const sorted = [...settledPayments].sort(
     (a, b) => new Date(a.date) - new Date(b.date)
   );
 
@@ -1036,6 +1054,7 @@ const summarizeLoan = (loan = {}, payments = [], { asOf = null } = {}) => {
     balanceAsOfDate: sorted.length ? sorted[sorted.length - 1].date : null,
 
     paymentCount: sorted.length,
+    pendingPaymentCount: pendingPayments.length,
     lastPaymentDate: sorted.length ? sorted[sorted.length - 1].date : null,
     remainingMonths: Number.isFinite(monthsLeft) ? monthsLeft : null,
     estimatedPayoffDate: payoff,
@@ -1109,6 +1128,17 @@ const validateLoanInput = (body = {}, { requireAll = true } = {}) => {
       errors.push('Original principal is out of range.');
     } else {
       value.originalPrincipal = roundHalfUp(principal, 2);
+    }
+  }
+
+  if (has('sanctionedLimit')) {
+    const limit = num(body.sanctionedLimit);
+    if (!Number.isFinite(limit) || limit < 0) {
+      errors.push('Sanctioned limit must be a non-negative number.');
+    } else if (limit > MAX_PRINCIPAL) {
+      errors.push('Sanctioned limit is out of range.');
+    } else {
+      value.sanctionedLimit = roundHalfUp(limit, 2);
     }
   }
 
@@ -1252,6 +1282,7 @@ module.exports = {
   splitEmi,
   buildAmortizationSchedule,
   computePaymentAllocation,
+  countsTowardBalance,
   sumPrincipalRepaid,
   outstandingBalance,
   remainingTenure,

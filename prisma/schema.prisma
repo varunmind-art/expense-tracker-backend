@@ -149,9 +149,10 @@ model Account {
   userId String
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  expenses Expense[]
-  incomes  Income[]
-  loans    Loan[]
+  expenses     Expense[]
+  incomes      Income[]
+  loans        Loan[]
+  emiSchedules LoanEmiSchedule[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -168,6 +169,18 @@ model Loan {
 
   originalPrincipal Decimal @db.Decimal(14, 2)
   currentPrincipal  Decimal @db.Decimal(14, 2)
+
+  // A staged-disbursement loan has an APPROVED limit that is larger than what
+  // has actually been drawn. `originalPrincipal` is the sanctioned limit for
+  // such a loan; `disbursedPrincipal` is the sum of the disbursement ledger and
+  // is recomputed from it, never incremented.
+  sanctionedLimit      Decimal? @db.Decimal(14, 2)
+  disbursedPrincipal   Decimal  @default(0) @db.Decimal(14, 2)
+  disbursementComplete Boolean  @default(false)
+
+  // Construction stage: the borrower pays interest only (pre-EMI) before the
+  // loan converts to full EMIs.
+  preEmiActive Boolean @default(false)
 
   interestRate Decimal? @db.Decimal(6, 3)
   emiAmount    Decimal? @db.Decimal(14, 2)
@@ -186,10 +199,85 @@ model Loan {
 
   payments LoanPayment[]
 
+  disbursements    LoanDisbursement[]
+  interestPostings LoanInterestPosting[]
+  emiSchedules     LoanEmiSchedule[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([userId])
+}
+
+/// One actual draw-down of the sanctioned limit.
+model LoanDisbursement {
+  id String @id @default(cuid())
+
+  date      DateTime
+  amount    Decimal  @db.Decimal(14, 2)
+  reference String? // bank tranche / UTR reference, used for duplicate detection
+  note      String?
+
+  loanId String
+  loan   Loan   @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([loanId, reference])
+  @@index([loanId])
+}
+
+/// Interest and charges the BANK posted, kept independently of repayments so a
+/// statement balance can be reconciled without inventing a principal/interest
+/// split on the repayment side.
+model LoanInterestPosting {
+  id String @id @default(cuid())
+
+  date      DateTime
+  amount    Decimal  @db.Decimal(14, 2)
+  kind      String   @default("INTEREST") // INTEREST | CHARGE
+  reference String?
+  note      String?
+
+  loanId String
+  loan   Loan   @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([loanId, reference])
+  @@index([loanId])
+}
+
+/// The contractual deduction schedule. Rows are SCHEDULED only: nothing here
+/// ever moves money. A row becomes CONFIRMED only when a real payment is
+/// recorded against it, which is what prevents duplicate posting.
+model LoanEmiSchedule {
+  id String @id @default(cuid())
+
+  sequence Int // 1-based, unique per loan
+  dueDate  DateTime
+  amount   Decimal  @db.Decimal(14, 2)
+  kind     String   @default("EMI") // PRE_EMI | EMI
+
+  status String @default("SCHEDULED") // SCHEDULED | CONFIRMED | STOPPED | SKIPPED
+
+  paymentAccountId String?
+  paymentAccount   Account? @relation(fields: [paymentAccountId], references: [id], onDelete: SetNull)
+
+  confirmedPaymentId String?      @unique
+  confirmedPayment   LoanPayment? @relation("EmiScheduleConfirmation", fields: [confirmedPaymentId], references: [id], onDelete: SetNull)
+
+  stoppedAt DateTime?
+  note      String?
+
+  loanId String
+  loan   Loan   @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([loanId, sequence])
+  @@index([loanId])
 }
 
 model LoanPayment {
@@ -206,10 +294,23 @@ model LoanPayment {
 
   note String?
 
+  // Where the row came from and whether the bank's split is known. A repayment
+  // whose principal/interest split is not bank-verified must not be presented as
+  // if it were: `allocationVerified` is false and the UI says so.
+  source             String  @default("MANUAL") // MANUAL | IMPORT | SCHEDULED
+  status             String  @default("CONFIRMED") // SCHEDULED (assumed) | CONFIRMED | REJECTED
+  allocationVerified Boolean @default(true)
+  externalRef        String? // bank reference; the duplicate key for imports
+
+  scheduledDate DateTime?
+
   loanId String
   loan   Loan   @relation(fields: [loanId], references: [id], onDelete: Cascade)
 
+  emiSchedule LoanEmiSchedule? @relation("EmiScheduleConfirmation")
+
   createdAt DateTime @default(now())
 
+  @@unique([loanId, externalRef])
   @@index([loanId])
 }

@@ -82,14 +82,27 @@ test('the tokenVersion migration name follows the Prisma timestamp convention', 
   assert.match(TOKEN_VERSION_MIGRATION, /^\d{14}_[a-z0-9_]+$/);
 });
 
-test('the new migration sorts AFTER every existing migration', () => {
+test('migrations sort chronologically and tokenVersion is not the newest', () => {
   const folders = migrationFolders();
+
+  // Every timestamped folder must be in lexicographic === chronological order.
+  const stamped = folders.filter((f) => /^\d{14}_/.test(f));
+  assert.deepEqual(stamped, [...stamped].sort(), 'timestamped migrations are not in order');
+
+  // tokenVersion is present and older than the newest migration. Asserting it is
+  // *last* was only ever true until the next migration shipped; what matters is
+  // that it sorts before anything that depends on it.
   const index = folders.indexOf(TOKEN_VERSION_MIGRATION);
   assert.notEqual(index, -1, 'migration folder not found');
-  assert.equal(index, folders.length - 1, `expected last, got position ${index} of ${folders.length}`);
+  assert.ok(index < folders.length - 1, 'a migration must sort after tokenVersion');
+
   // The accounts folder uses a non-conforming name and relies on lexicographic
   // luck. It is deliberately NOT renamed until P0-7 reconciles migration state.
   assert.ok(folders.includes('20261004_add_accounts_and_loans'));
+
+  // The staged-disbursement migration must sort after every earlier one so it
+  // applies on databases that already have the Loan tables.
+  assert.equal(folders[folders.length - 1], '20261018052001_add_loan_disbursements_and_schedules');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

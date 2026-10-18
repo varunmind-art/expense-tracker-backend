@@ -45,6 +45,16 @@ const {
   authorizeCategory,
 } = require('./lib/authorization');
 const {
+  LEDGER_KIND,
+  reconcileLoanAccount,
+  previewImport,
+  buildEmiSchedule,
+  stopSchedule,
+  nextScheduledDeduction,
+  canConfirmScheduleRow,
+} = require('./lib/loanLedger');
+const {
+  MAX_PERIODS,
   buildAmortizationSchedule,
   computePaymentAllocation,
   outstandingBalance,
@@ -5129,6 +5139,10 @@ const serializeLoan = (loan) => ({
   loanType: loan.loanType,
   originalPrincipal: decimalToNumber(loan.originalPrincipal),
   currentPrincipal: decimalToNumber(loan.currentPrincipal),
+  sanctionedLimit: decimalToNumber(loan.sanctionedLimit),
+  disbursedPrincipal: decimalToNumber(loan.disbursedPrincipal),
+  disbursementComplete: loan.disbursementComplete ?? false,
+  preEmiActive: loan.preEmiActive ?? false,
   interestRate: decimalToNumber(loan.interestRate),
   emiAmount: decimalToNumber(loan.emiAmount),
   startDate: loan.startDate,
@@ -5433,6 +5447,7 @@ app.post(
           loanType: input.loanType ?? 'HOME_LOAN',
           originalPrincipal,
           currentPrincipal,
+          sanctionedLimit: input.sanctionedLimit ?? null,
           interestRate,
           emiAmount: emiAmount ?? null,
           startDate: input.startDate ?? null,
@@ -6201,6 +6216,742 @@ app.post(
     }
   }
 );
+
+// ==========================================
+// 13c. LOAN LEDGER (staged disbursement, interest, schedules, import)
+// ==========================================
+//
+// A construction-linked loan is not one number. This section keeps four
+// independent records — disbursements, bank-posted interest/charges, repayments
+// and a contractual deduction schedule — and reconciles them.
+//
+// Two rules are enforced everywhere here:
+//   1. Nothing in this section ever moves money. A schedule row is a
+//      DESCRIPTION of a deduction; it becomes CONFIRMED only when a real payment
+//      is recorded against it, and a confirmed row can never be confirmed twice.
+//   2. A repayment whose principal/interest split the bank did not provide is
+//      never given an invented split. It imports with `allocationVerified:false`
+//      and only its total affects the bank-balance reconciliation.
+
+const loadLoanLedgerContext = async (userId, loanId) => {
+  const loan = await findOwnedLoan(userId, loanId);
+  if (!loan) return null;
+
+  const [disbursements, interestPostings, payments, emiSchedules] = await Promise.all([
+    prisma.loanDisbursement.findMany({ where: { loanId: loan.id }, orderBy: [{ date: 'asc' }, { createdAt: 'asc' }] }),
+    prisma.loanInterestPosting.findMany({ where: { loanId: loan.id }, orderBy: [{ date: 'asc' }, { createdAt: 'asc' }] }),
+    prisma.loanPayment.findMany({ where: { loanId: loan.id }, orderBy: [{ date: 'asc' }, { createdAt: 'asc' }] }),
+    prisma.loanEmiSchedule.findMany({ where: { loanId: loan.id }, orderBy: { sequence: 'asc' } }),
+  ]);
+
+  return { loan, disbursements, interestPostings, payments, emiSchedules };
+};
+
+const serializeDisbursement = (row) => ({
+  id: row.id,
+  loanId: row.loanId,
+  date: row.date,
+  amount: decimalToNumber(row.amount),
+  reference: row.reference,
+  note: row.note,
+  createdAt: row.createdAt,
+});
+
+const serializeInterestPosting = (row) => ({
+  id: row.id,
+  loanId: row.loanId,
+  date: row.date,
+  amount: decimalToNumber(row.amount),
+  kind: row.kind,
+  reference: row.reference,
+  note: row.note,
+  createdAt: row.createdAt,
+});
+
+const serializeScheduleRow = (row) => ({
+  id: row.id,
+  loanId: row.loanId,
+  sequence: row.sequence,
+  dueDate: row.dueDate,
+  amount: decimalToNumber(row.amount),
+  kind: row.kind,
+  status: row.status,
+  paymentAccountId: row.paymentAccountId,
+  confirmedPaymentId: row.confirmedPaymentId,
+  stoppedAt: row.stoppedAt,
+  note: row.note,
+});
+
+/**
+ * `disbursedPrincipal` is derived from the ledger, never incremented, so it
+ * cannot drift. With no ledger it equals the loan's principal.
+ */
+const resyncDisbursedPrincipal = async (loan) => {
+  const agg = await prisma.loanDisbursement.aggregate({
+    where: { loanId: loan.id },
+    _sum: { amount: true },
+    _count: true,
+  });
+
+  const ledgerPaise = agg._count > 0 ? toPaise(agg._sum.amount) : toPaise(loan.originalPrincipal);
+  const disbursedPrincipal = fromPaise(ledgerPaise);
+
+  if (toPaise(loan.disbursedPrincipal) !== ledgerPaise) {
+    return prisma.loan.update({ where: { id: loan.id }, data: { disbursedPrincipal } });
+  }
+  return loan;
+};
+
+/** Reject a duplicate bank reference with a 409 rather than a Prisma error. */
+const isUniqueViolation = (error) => error && error.code === 'P2002';
+
+// ---- disbursements -------------------------------------------------------
+
+app.get('/api/loans/:id/disbursements', authenticateToken, async (req, res) => {
+  try {
+    const context = await loadLoanLedgerContext(req.user.id, req.params.id);
+    if (!context) return loanNotFound(res);
+
+    const rows = context.disbursements.map(serializeDisbursement);
+    const total = rows.reduce((sum, row) => sum + toPaise(row.amount), 0);
+
+    res.json({
+      loanId: context.loan.id,
+      count: rows.length,
+      totalDisbursed: fromPaise(total),
+      sanctionedLimit: decimalToNumber(context.loan.sanctionedLimit),
+      undrawnLimit:
+        context.loan.sanctionedLimit === null || context.loan.sanctionedLimit === undefined
+          ? null
+          : fromPaise(Math.max(0, toPaise(context.loan.sanctionedLimit) - total)),
+      disbursements: rows,
+    });
+  } catch (error) {
+    console.error('Fetch disbursements error:', error);
+    res.status(500).json({ error: 'Failed to fetch disbursements.' });
+  }
+});
+
+app.post('/api/loans/:id/disbursements', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    const amount = num(req.body?.amount);
+    const date = req.body?.date === undefined ? new Date() : new Date(req.body.date);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Disbursement amount must be greater than zero.' });
+    }
+    if (Number.isNaN(date.getTime())) {
+      return res.status(400).json({ error: 'Disbursement date is not a valid date.' });
+    }
+
+    const reference = req.body?.reference === undefined || req.body.reference === null
+      ? null
+      : String(req.body.reference).trim().slice(0, 200) || null;
+
+    const row = await prisma.loanDisbursement.create({
+      data: {
+        loanId: loan.id,
+        date,
+        amount: fromPaise(toPaise(amount)),
+        reference,
+        note: req.body?.note ? String(req.body.note).slice(0, 500) : null,
+      },
+    });
+
+    await resyncDisbursedPrincipal(loan);
+    res.status(201).json({ disbursement: serializeDisbursement(row) });
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      return res.status(409).json({ error: 'A disbursement with that bank reference already exists.' });
+    }
+    console.error('Create disbursement error:', error);
+    res.status(500).json({ error: 'Failed to record the disbursement.' });
+  }
+});
+
+app.delete('/api/loans/:id/disbursements/:disbursementId', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    const existing = await prisma.loanDisbursement.findFirst({
+      where: { id: req.params.disbursementId, loanId: loan.id },
+    });
+    if (!existing) return res.status(404).json({ error: 'Disbursement not found.' });
+
+    await prisma.loanDisbursement.delete({ where: { id: existing.id } });
+    await resyncDisbursedPrincipal(loan);
+
+    res.json({ message: 'Disbursement removed.', id: existing.id });
+  } catch (error) {
+    console.error('Delete disbursement error:', error);
+    res.status(500).json({ error: 'Failed to remove the disbursement.' });
+  }
+});
+
+// ---- interest and charges ------------------------------------------------
+
+app.get('/api/loans/:id/interest-postings', authenticateToken, async (req, res) => {
+  try {
+    const context = await loadLoanLedgerContext(req.user.id, req.params.id);
+    if (!context) return loanNotFound(res);
+
+    const rows = context.interestPostings.map(serializeInterestPosting);
+    const interest = rows.filter((r) => String(r.kind).toUpperCase() !== 'CHARGE')
+      .reduce((s, r) => s + toPaise(r.amount), 0);
+    const charges = rows.filter((r) => String(r.kind).toUpperCase() === 'CHARGE')
+      .reduce((s, r) => s + toPaise(r.amount), 0);
+
+    res.json({
+      loanId: context.loan.id,
+      count: rows.length,
+      totalInterest: fromPaise(interest),
+      totalCharges: fromPaise(charges),
+      postings: rows,
+    });
+  } catch (error) {
+    console.error('Fetch interest postings error:', error);
+    res.status(500).json({ error: 'Failed to fetch interest postings.' });
+  }
+});
+
+app.post('/api/loans/:id/interest-postings', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    const amount = num(req.body?.amount);
+    const date = req.body?.date === undefined ? new Date() : new Date(req.body.date);
+    const kind = String(req.body?.kind || 'INTEREST').toUpperCase();
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Posting amount must be greater than zero.' });
+    }
+    if (Number.isNaN(date.getTime())) {
+      return res.status(400).json({ error: 'Posting date is not a valid date.' });
+    }
+    if (kind !== 'INTEREST' && kind !== 'CHARGE') {
+      return res.status(400).json({ error: 'Posting kind must be INTEREST or CHARGE.' });
+    }
+
+    const reference = req.body?.reference === undefined || req.body.reference === null
+      ? null
+      : String(req.body.reference).trim().slice(0, 200) || null;
+
+    const row = await prisma.loanInterestPosting.create({
+      data: {
+        loanId: loan.id,
+        date,
+        amount: fromPaise(toPaise(amount)),
+        kind,
+        reference,
+        note: req.body?.note ? String(req.body.note).slice(0, 500) : null,
+      },
+    });
+
+    res.status(201).json({ posting: serializeInterestPosting(row) });
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      return res.status(409).json({ error: 'An interest posting with that bank reference already exists.' });
+    }
+    console.error('Create interest posting error:', error);
+    res.status(500).json({ error: 'Failed to record the interest posting.' });
+  }
+});
+
+app.delete('/api/loans/:id/interest-postings/:postingId', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    const existing = await prisma.loanInterestPosting.findFirst({
+      where: { id: req.params.postingId, loanId: loan.id },
+    });
+    if (!existing) return res.status(404).json({ error: 'Interest posting not found.' });
+
+    await prisma.loanInterestPosting.delete({ where: { id: existing.id } });
+    res.json({ message: 'Interest posting removed.', id: existing.id });
+  } catch (error) {
+    console.error('Delete interest posting error:', error);
+    res.status(500).json({ error: 'Failed to remove the interest posting.' });
+  }
+});
+
+// ---- reconciliation view -------------------------------------------------
+
+app.get('/api/loans/:id/reconciliation', authenticateToken, async (req, res) => {
+  try {
+    const context = await loadLoanLedgerContext(req.user.id, req.params.id);
+    if (!context) return loanNotFound(res);
+
+    let asOf = null;
+    if (req.query.asOf !== undefined && req.query.asOf !== '') {
+      asOf = new Date(req.query.asOf);
+      if (Number.isNaN(asOf.getTime())) {
+        return res.status(400).json({ error: 'asOf is not a valid date.' });
+      }
+    }
+
+    let statedBankBalance = null;
+    if (req.query.statedBalance !== undefined && req.query.statedBalance !== '') {
+      statedBankBalance = num(req.query.statedBalance);
+      if (!Number.isFinite(statedBankBalance)) {
+        return res.status(400).json({ error: 'statedBalance must be a number.' });
+      }
+    }
+
+    const reconciliation = reconcileLoanAccount({
+      loan: { ...context.loan, statedBankBalance },
+      disbursements: context.disbursements,
+      interestPostings: context.interestPostings,
+      payments: context.payments,
+      asOf,
+    });
+
+    res.json({
+      loanId: context.loan.id,
+      ...reconciliation,
+      // The two numbers people confuse, stated side by side and explicitly distinct.
+      explanation:
+        'bankBalance = disbursed + interest posted + charges - repayments. ' +
+        'outstandingPrincipal = disbursed - principal repaid. They differ by unpaid interest and charges.',
+    });
+  } catch (error) {
+    console.error('Loan reconciliation error:', error);
+    res.status(500).json({ error: 'Failed to reconcile the loan account.' });
+  }
+});
+
+// ---- import: dry run, then commit ---------------------------------------
+
+app.post('/api/loans/:id/import/preview', authenticateToken, async (req, res) => {
+  try {
+    const context = await loadLoanLedgerContext(req.user.id, req.params.id);
+    if (!context) return loanNotFound(res);
+
+    const input = req.body?.csv !== undefined ? req.body.csv : req.body?.rows;
+    if (input === undefined) {
+      return res.status(400).json({ error: 'Provide `csv` text or a `rows` array.' });
+    }
+
+    const preview = previewImport({
+      input,
+      loan: context.loan,
+      disbursements: context.disbursements,
+      interestPostings: context.interestPostings,
+      payments: context.payments,
+    });
+
+    res.json({
+      loanId: context.loan.id,
+      dryRun: true,
+      committed: false,
+      ...preview,
+      // Nothing above this line wrote anything. The commit endpoint is separate
+      // and refuses to run unless it is explicitly asked to.
+    });
+  } catch (error) {
+    console.error('Import preview error:', error);
+    res.status(500).json({ error: 'Failed to preview the import.' });
+  }
+});
+
+app.post('/api/loans/:id/import/commit', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    // Two explicit gates: the caller must re-state intent, and a preview with
+    // unreadable rows cannot be committed at all.
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({
+        error: 'Import not committed. Re-send with `confirm: true` after reviewing the preview.',
+      });
+    }
+
+    const context = await loadLoanLedgerContext(req.user.id, loan.id);
+    const input = req.body?.csv !== undefined ? req.body.csv : req.body?.rows;
+    if (input === undefined) {
+      return res.status(400).json({ error: 'Provide `csv` text or a `rows` array.' });
+    }
+
+    const preview = previewImport({
+      input,
+      loan: context.loan,
+      disbursements: context.disbursements,
+      interestPostings: context.interestPostings,
+      payments: context.payments,
+    });
+
+    if (preview.blocking) {
+      return res.status(400).json({
+        error: 'The import contains unreadable rows. Fix or remove them and preview again.',
+        errors: preview.errors,
+      });
+    }
+
+    const onlyNew = preview.rows.filter((row) => row.status === 'NEW');
+    if (onlyNew.length === 0) {
+      return res.json({
+        message: 'Nothing to import: every row is already recorded.',
+        imported: { disbursements: 0, interestPostings: 0, payments: 0 },
+        skipped: preview.summary.duplicates,
+      });
+    }
+
+    const result = await prisma.$transaction(async (db) => {
+      let disbursements = 0;
+      let interestPostings = 0;
+      let paymentsCreated = 0;
+
+      for (const row of onlyNew) {
+        if (row.kind === 'DISBURSEMENT') {
+          await db.loanDisbursement.create({
+            data: {
+              loanId: loan.id,
+              date: row.date,
+              amount: row.amount,
+              reference: row.reference,
+              note: row.note,
+            },
+          });
+          disbursements += 1;
+        } else if (row.kind === 'INTEREST' || row.kind === 'CHARGE') {
+          await db.loanInterestPosting.create({
+            data: {
+              loanId: loan.id,
+              date: row.date,
+              amount: row.amount,
+              kind: row.kind,
+              reference: row.reference,
+              note: row.note,
+            },
+          });
+          interestPostings += 1;
+        } else {
+          // A repayment. Its split is whatever the bank verified — possibly
+          // nothing, in which case the split is zero and flagged unverified.
+          const allocation = row.allocation || { principalAmount: 0, interestAmount: 0, extraPrincipal: 0 };
+          await db.loanPayment.create({
+            data: {
+              loanId: loan.id,
+              date: row.date,
+              totalAmount: row.amount,
+              principalAmount: allocation.principalAmount,
+              interestAmount: allocation.interestAmount,
+              extraPrincipal: allocation.extraPrincipal,
+              outstandingAfter: null,
+              note: row.note,
+              source: 'IMPORT',
+              status: 'CONFIRMED',
+              allocationVerified: row.allocationVerified,
+              externalRef: row.reference,
+            },
+          });
+          paymentsCreated += 1;
+        }
+      }
+
+      return { disbursements, interestPostings, payments: paymentsCreated };
+    });
+
+    // Recompute the derived columns from the ledger after an import.
+    await resyncDisbursedPrincipal(loan);
+    await resyncLoanLedger(loan);
+
+    res.status(201).json({
+      message: 'Import committed.',
+      imported: result,
+      skipped: preview.summary.duplicates,
+      reconciliation: preview.reconciliation,
+    });
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      return res.status(409).json({ error: 'A row with the same bank reference already exists.' });
+    }
+    console.error('Import commit error:', error);
+    res.status(500).json({ error: 'Failed to commit the import.' });
+  }
+});
+
+// ---- EMI schedule (scheduled / assumed deductions) ----------------------
+
+app.get('/api/loans/:id/emi-schedule', authenticateToken, async (req, res) => {
+  try {
+    const context = await loadLoanLedgerContext(req.user.id, req.params.id);
+    if (!context) return loanNotFound(res);
+
+    const rows = context.emiSchedules.map(serializeScheduleRow);
+    const totalScheduled = rows
+      .filter((r) => String(r.status).toUpperCase() === 'SCHEDULED')
+      .reduce((s, r) => s + toPaise(r.amount), 0);
+
+    res.json({
+      loanId: context.loan.id,
+      count: rows.length,
+      totalScheduled: fromPaise(totalScheduled),
+      nextDeduction: serializeScheduleRow(nextScheduledDeduction(context.emiSchedules) || {}) ,
+      rows,
+    });
+  } catch (error) {
+    console.error('Fetch EMI schedule error:', error);
+    res.status(500).json({ error: 'Failed to fetch the deduction schedule.' });
+  }
+});
+
+app.post('/api/loans/:id/emi-schedule/generate', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    const existing = await prisma.loanEmiSchedule.count({ where: { loanId: loan.id } });
+    if (existing > 0 && req.body?.replace !== true) {
+      return res.status(409).json({
+        error: `This loan already has ${existing} schedule rows. Send replace: true to rebuild the future ones.`,
+      });
+    }
+
+    const firstDueDate = req.body?.firstDueDate ? new Date(req.body.firstDueDate) : loan.startDate;
+    if (!firstDueDate || Number.isNaN(firstDueDate.getTime())) {
+      return res.status(400).json({ error: 'A valid firstDueDate is required.' });
+    }
+
+    const installments = Number(req.body?.installments);
+    const amount = num(req.body?.amount);
+    const kind = String(req.body?.kind || 'EMI').toUpperCase();
+
+    if (!Number.isInteger(installments) || installments <= 0 || installments > MAX_PERIODS) {
+      return res.status(400).json({ error: `installments must be a whole number between 1 and ${MAX_PERIODS}.` });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'amount must be greater than zero.' });
+    }
+    if (kind !== 'EMI' && kind !== 'PRE_EMI') {
+      return res.status(400).json({ error: 'kind must be EMI or PRE_EMI.' });
+    }
+
+    const built = buildEmiSchedule({
+      firstDueDate,
+      installments,
+      amount,
+      kind,
+      dueDay: loan.emiDay,
+      note: req.body?.note ? String(req.body.note).slice(0, 500) : null,
+    });
+
+    const created = await prisma.$transaction(async (db) => {
+      // Never destroy history: only SCHEDULED rows are replaced.
+      await db.loanEmiSchedule.deleteMany({ where: { loanId: loan.id, status: 'SCHEDULED' } });
+      const rows = [];
+      for (const row of built.rows) {
+        rows.push(
+          await db.loanEmiSchedule.create({
+            data: {
+              loanId: loan.id,
+              sequence: row.sequence,
+              dueDate: row.dueDate,
+              amount: row.amount,
+              kind: row.kind,
+              status: 'SCHEDULED',
+              paymentAccountId: loan.paymentAccountId,
+              note: row.note,
+            },
+          })
+        );
+      }
+      return rows;
+    });
+
+    res.status(201).json({
+      loanId: loan.id,
+      count: created.length,
+      totalScheduled: built.total,
+      rows: created.map(serializeScheduleRow),
+    });
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      return res.status(409).json({ error: 'That schedule sequence already exists.' });
+    }
+    console.error('Generate EMI schedule error:', error);
+    res.status(500).json({ error: 'Failed to build the deduction schedule.' });
+  }
+});
+
+app.patch('/api/loans/:id/emi-schedule/:scheduleId', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    const row = await prisma.loanEmiSchedule.findFirst({
+      where: { id: req.params.scheduleId, loanId: loan.id },
+    });
+    if (!row) return res.status(404).json({ error: 'Schedule row not found.' });
+
+    if (String(row.status).toUpperCase() !== 'SCHEDULED') {
+      return res.status(409).json({
+        error: `A ${String(row.status).toLowerCase()} instalment cannot be re-priced; only scheduled rows can.`,
+      });
+    }
+
+    const amount = num(req.body?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'amount must be greater than zero.' });
+    }
+
+    const updated = await prisma.loanEmiSchedule.update({
+      where: { id: row.id },
+      data: {
+        amount: fromPaise(toPaise(amount)),
+        note: req.body?.note === undefined ? row.note : String(req.body.note || '').slice(0, 500) || null,
+      },
+    });
+
+    res.json({ row: serializeScheduleRow(updated) });
+  } catch (error) {
+    console.error('Update schedule row error:', error);
+    res.status(500).json({ error: 'Failed to update the schedule row.' });
+  }
+});
+
+app.post('/api/loans/:id/emi-schedule/stop', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    let fromDate = null;
+    if (req.body?.fromDate !== undefined && req.body.fromDate !== null && req.body.fromDate !== '') {
+      fromDate = new Date(req.body.fromDate);
+      if (Number.isNaN(fromDate.getTime())) {
+        return res.status(400).json({ error: 'fromDate is not a valid date.' });
+      }
+    }
+
+    const existing = await prisma.loanEmiSchedule.findMany({
+      where: { loanId: loan.id },
+      orderBy: { sequence: 'asc' },
+    });
+    const planned = stopSchedule({
+      existing,
+      fromDate,
+      reason: req.body?.reason ? String(req.body.reason).slice(0, 500) : 'Stopped',
+    });
+
+    // Only rows that actually changed are written, matched BY ID. Comparing by
+    // array position would stop the wrong row whenever the database returns the
+    // rows in a different order - including a CONFIRMED row, which must never
+    // happen: confirmed instalments are recorded history.
+    const plannedById = new Map(planned.map((row) => [row.id, row]));
+    const toStop = existing.filter((before) => {
+      const after = plannedById.get(before.id);
+      return after && before.status !== after.status;
+    }).map((before) => plannedById.get(before.id));
+
+    const stopped = await prisma.$transaction(async (db) => {
+      let count = 0;
+      for (const row of toStop) {
+        await db.loanEmiSchedule.update({
+          where: { id: row.id },
+          data: { status: 'STOPPED', stoppedAt: new Date(), note: row.note },
+        });
+        count += 1;
+      }
+      return count;
+    });
+
+    res.json({
+      message: `Stopped ${stopped} future deduction${stopped === 1 ? '' : 's'}. Recorded history is unchanged.`,
+      stopped,
+      preserved: existing.filter((r) => String(r.status).toUpperCase() === 'CONFIRMED').length,
+    });
+  } catch (error) {
+    console.error('Stop schedule error:', error);
+    res.status(500).json({ error: 'Failed to stop the schedule.' });
+  }
+});
+
+app.post('/api/loans/:id/emi-schedule/:scheduleId/confirm', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    const row = await prisma.loanEmiSchedule.findFirst({
+      where: { id: req.params.scheduleId, loanId: loan.id },
+    });
+    if (!row) return res.status(404).json({ error: 'Schedule row not found.' });
+
+    // The duplicate-posting guard. A row that already has a payment cannot be
+    // confirmed again, whatever the client asks for.
+    const gate = canConfirmScheduleRow(row);
+    if (!gate.ok) return res.status(409).json({ error: gate.reason });
+
+    const amount = req.body?.amount === undefined ? decimalToNumber(row.amount) : num(req.body.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Confirmation amount must be greater than zero.' });
+    }
+
+    const date = req.body?.date === undefined ? new Date(row.dueDate) : new Date(req.body.date);
+    if (Number.isNaN(date.getTime())) {
+      return res.status(400).json({ error: 'Confirmation date is not a valid date.' });
+    }
+
+    const history = await prisma.loanPayment.findMany({
+      where: { loanId: loan.id },
+      orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+    });
+    const opening = outstandingBalance({ originalPrincipal: loan.originalPrincipal }, history);
+
+    const allocation = computePaymentAllocation({
+      openingBalance: opening,
+      annualRatePercent: loan.interestRate ?? 0,
+      amount,
+      kind: 'EMI',
+      date,
+    });
+    if (!allocation.ok) return res.status(400).json({ error: allocation.error });
+
+    const result = await prisma.$transaction(async (db) => {
+      const payment = await db.loanPayment.create({
+        data: {
+          loanId: loan.id,
+          date,
+          totalAmount: allocation.totalAmount,
+          principalAmount: allocation.principalAmount,
+          interestAmount: allocation.interestAmount,
+          extraPrincipal: allocation.extraPrincipal,
+          outstandingAfter: allocation.outstandingAfter,
+          note: req.body?.note ? String(req.body.note).slice(0, 500) : `Confirmed instalment #${row.sequence}`,
+          source: 'SCHEDULED',
+          status: 'CONFIRMED',
+          allocationVerified: true,
+          scheduledDate: row.dueDate,
+        },
+      });
+
+      const scheduleRow = await db.loanEmiSchedule.update({
+        where: { id: row.id },
+        data: { status: 'CONFIRMED', confirmedPaymentId: payment.id },
+      });
+
+      return { payment, scheduleRow };
+    });
+
+    await resyncLoanLedger(loan);
+
+    res.status(201).json({
+      payment: serializePayment(result.payment),
+      row: serializeScheduleRow(result.scheduleRow),
+    });
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      return res.status(409).json({ error: 'This instalment is already confirmed.' });
+    }
+    console.error('Confirm schedule row error:', error);
+    res.status(500).json({ error: 'Failed to confirm the instalment.' });
+  }
+});
 
 // ==========================================
 // 14. PING + START
