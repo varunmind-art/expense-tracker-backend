@@ -182,6 +182,11 @@ model Loan {
   // loan converts to full EMIs.
   preEmiActive Boolean @default(false)
 
+  // A loan can be fully repaid on the bank's ledger and still not be formally
+  // closed: SBI's statement may show a paisa outstanding and "Account Open".
+  // This records that state without pretending the account is closed.
+  settlementPending Boolean @default(false)
+
   interestRate Decimal? @db.Decimal(6, 3)
   emiAmount    Decimal? @db.Decimal(14, 2)
 

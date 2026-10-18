@@ -44,6 +44,11 @@ const LEDGER_KIND = {
   DISBURSEMENT: 'DISBURSEMENT',
   INTEREST: 'INTEREST',
   CHARGE: 'CHARGE',
+  // A fee the bank assessed is sometimes immediately offset ("single sided
+  // repayment of CERSAI charges"). Both legs are balance-changing and both must
+  // be kept, but the offset is NOT a loan repayment: counting it as one would
+  // overstate repayments and understate the balance.
+  CHARGE_SETTLEMENT: 'CHARGE_SETTLEMENT',
   REPAYMENT: 'REPAYMENT',
 };
 
@@ -140,14 +145,16 @@ const reconcileLoanAccount = ({
   const principalPaise = toPaise(loan.originalPrincipal);
   const disbursedPaise = disbursementRows.length > 0 ? ledgerDisbursedPaise : principalPaise;
 
-  const interestPaise = sumPaise(
-    interestRows.filter((r) => String(r.kind || 'INTEREST').toUpperCase() !== 'CHARGE'),
+  const kindOf = (r) => String(r.kind || 'INTEREST').toUpperCase();
+
+  const interestPaise = sumPaise(interestRows.filter((r) => kindOf(r) === 'INTEREST'), (r) => r.amount);
+  const chargeGrossPaise = sumPaise(interestRows.filter((r) => kindOf(r) === 'CHARGE'), (r) => r.amount);
+  const chargeSettlementPaise = sumPaise(
+    interestRows.filter((r) => kindOf(r) === 'CHARGE_SETTLEMENT'),
     (r) => r.amount
   );
-  const chargePaise = sumPaise(
-    interestRows.filter((r) => String(r.kind || '').toUpperCase() === 'CHARGE'),
-    (r) => r.amount
-  );
+  // Net charges: a fee and its offset cancel, so the balance is unaffected.
+  const chargePaise = chargeGrossPaise - chargeSettlementPaise;
 
   const repaidPaise = sumPaise(counted, (p) => p.totalAmount);
   const principalRepaidPaise =
@@ -178,6 +185,7 @@ const reconcileLoanAccount = ({
 
     totalInterestPosted: fromPaise(interestPaise),
     totalChargesPosted: fromPaise(chargePaise),
+    totalChargeSettlements: fromPaise(chargeSettlementPaise),
     totalInterestAndCharges: fromPaise(interestPaise + chargePaise),
 
     totalRepaid: fromPaise(repaidPaise),
@@ -301,8 +309,8 @@ const parseBankDate = (value) => {
 const HEADER_ALIASES = {
   date: ['date', 'txn date', 'transaction date', 'value date', 'posting date', 'tran date'],
   amount: ['amount', 'txn amount', 'transaction amount', 'debit', 'credit', 'amount (inr)', 'amount inr'],
-  kind: ['type', 'kind', 'txn type', 'transaction type', 'entry type'],
-  reference: ['reference', 'ref', 'cheque no', 'chq no', 'utr', 'transaction id', 'txn id', 'ref no'],
+  kind: ['type', 'kind', 'txn type', 'transaction type', 'entry type', 'entrytype', 'entry_type'],
+  reference: ['reference', 'ref', 'cheque no', 'chq no', 'utr', 'transaction id', 'txn id', 'ref no', 'sourcerowkey', 'source row key', 'sourcekey'],
   note: ['note', 'description', 'narration', 'particulars', 'remarks'],
   principal: ['principal', 'principal amount', 'principal (inr)'],
   interest: ['interest', 'interest amount', 'interest (inr)'],
@@ -339,7 +347,26 @@ const mapHeaders = (cells) => {
 };
 
 /** Infer DISBURSEMENT / INTEREST / CHARGE / REPAYMENT from the row's own words. */
+const EXPLICIT_KIND_ALIASES = {
+  DISBURSEMENT: LEDGER_KIND.DISBURSEMENT,
+  DISBURSE: LEDGER_KIND.DISBURSEMENT,
+  INTEREST: LEDGER_KIND.INTEREST,
+  INTEREST_POSTED: LEDGER_KIND.INTEREST,
+  CHARGE: LEDGER_KIND.CHARGE,
+  FEE: LEDGER_KIND.CHARGE,
+  CHARGE_SETTLEMENT: LEDGER_KIND.CHARGE_SETTLEMENT,
+  FEE_SETTLEMENT: LEDGER_KIND.CHARGE_SETTLEMENT,
+  REPAYMENT: LEDGER_KIND.REPAYMENT,
+  REPAYMENT_UNALLOCATED: LEDGER_KIND.REPAYMENT,
+  PAYMENT: LEDGER_KIND.REPAYMENT,
+};
+
 const inferKind = (rawKind, note, amount) => {
+  // A ledger exported by the bank already says what each row is. Trust that
+  // column first; only guess from the narration when it is absent or unknown.
+  const explicitKey = String(rawKind || '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if (explicitKey && EXPLICIT_KIND_ALIASES[explicitKey]) return EXPLICIT_KIND_ALIASES[explicitKey];
+
   const text = `${rawKind || ''} ${note || ''}`.toLowerCase();
 
   // Word stems, not whole words: bank narrations say "Repayment", "Disbursement",
@@ -350,8 +377,12 @@ const inferKind = (rawKind, note, amount) => {
   const isDisbursement = /\b(disburs\w*|tranche\w*|draw ?down\w*|release\w*)/.test(text);
 
   if (isDisbursement) return LEDGER_KIND.DISBURSEMENT;
-  // "Interest charged" is interest; a bare "Charge"/"Fee" is a charge.
+  // "Interest charged" is interest; a bare "Charge"/"Fee" is a charge. A fee
+  // described as already settled is a charge settlement, not a repayment.
   if (isInterest && !isRepayment) return LEDGER_KIND.INTEREST;
+  if (isCharge && /\b(settle\w*|recover\w*|reimburse\w*|offset\w*|single.?sided)/.test(text)) {
+    return LEDGER_KIND.CHARGE_SETTLEMENT;
+  }
   if (isCharge && !isRepayment) return LEDGER_KIND.CHARGE;
   if (isRepayment) return LEDGER_KIND.REPAYMENT;
 
@@ -567,7 +598,12 @@ const previewImport = ({
     interestPostings: [
       ...(interestPostings || []),
       ...onlyNew
-        .filter((r) => r.kind === LEDGER_KIND.INTEREST || r.kind === LEDGER_KIND.CHARGE)
+        .filter(
+          (r) =>
+            r.kind === LEDGER_KIND.INTEREST ||
+            r.kind === LEDGER_KIND.CHARGE ||
+            r.kind === LEDGER_KIND.CHARGE_SETTLEMENT
+        )
         .map((r) => ({ date: r.date, amount: r.amount, kind: r.kind, reference: r.reference })),
     ],
     payments: [

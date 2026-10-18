@@ -1210,6 +1210,10 @@ const validateLoanInput = (body = {}, { requireAll = true } = {}) => {
     value.isActive = Boolean(body.isActive);
   }
 
+  if (has('settlementPending')) {
+    value.settlementPending = Boolean(body.settlementPending);
+  }
+
   // An explicit instalment count is accepted as an input convenience and is
   // mapped onto an end date by the routes. It is NOT a stored column, so it is
   // always stripped before a Prisma write.

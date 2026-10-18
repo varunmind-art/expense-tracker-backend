@@ -417,3 +417,33 @@ test('the ledger endpoints are owned through the parent loan', async () => {
 
   await cleanupLoan(id);
 });
+test('a charge settlement imports as a credit posting, never as a repayment', async () => {
+  const created = await makeLoan({ name: `${P}ChargeSettle` });
+  const id = created.json.id;
+
+  // The bank assesses a fee and immediately offsets it. Both legs are
+  // balance-changing; neither is a loan repayment.
+  const csv =
+    'Date,Narration,Amount,EntryType,Reference\n' +
+    '31/01/2026,CERSAI charges recovery,118,CHARGE,CS-1\n' +
+    '04/02/2026,Single sided repayment of CERSAI charges,118,CHARGE_SETTLEMENT,CS-2\n' +
+    '10/02/2026,O.S. deposit transfer,52000,REPAYMENT_UNALLOCATED,CS-3\n';
+
+  const commit = await api('POST', `/api/loans/${id}/import/commit`, { token: tokenA, body: { csv, confirm: true } });
+  assert.equal(commit.status, 201, commit.text);
+  // REGRESSION: the settlement used to fall through to the repayment branch.
+  assert.deepEqual(commit.json.imported, { disbursements: 0, interestPostings: 2, payments: 1 });
+
+  const postings = await prisma.loanInterestPosting.findMany({ where: { loanId: id } });
+  assert.deepEqual(postings.map((p) => p.kind).sort(), ['CHARGE', 'CHARGE_SETTLEMENT']);
+
+  const payments = await prisma.loanPayment.findMany({ where: { loanId: id } });
+  assert.equal(payments.length, 1, 'the settlement must not create a second payment');
+  assert.equal(Number(payments[0].totalAmount), 52000);
+
+  const recon = await api('GET', `/api/loans/${id}/reconciliation`, { token: tokenA });
+  assert.equal(recon.json.totalChargesPosted, 0, 'the fee is offset');
+  assert.equal(recon.json.totalRepaid, 52000, 'the offset is not a repayment');
+
+  await cleanupLoan(id);
+});

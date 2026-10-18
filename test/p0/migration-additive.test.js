@@ -100,9 +100,13 @@ test('migrations sort chronologically and tokenVersion is not the newest', () =>
   // luck. It is deliberately NOT renamed until P0-7 reconciles migration state.
   assert.ok(folders.includes('20261004_add_accounts_and_loans'));
 
-  // The staged-disbursement migration must sort after every earlier one so it
-  // applies on databases that already have the Loan tables.
-  assert.equal(folders[folders.length - 1], '20261018052001_add_loan_disbursements_and_schedules');
+  // Everything newer than tokenVersion is part of the staged-disbursement
+  // release and must sort after it, so it applies on a database that already has
+  // the Loan tables. These are exactly the migrations still pending in production.
+  assert.deepEqual(folders.slice(index + 1), [
+    '20261018052001_add_loan_disbursements_and_schedules',
+    '20261018061000_add_loan_settlement_pending',
+  ]);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

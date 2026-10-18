@@ -519,3 +519,73 @@ test('staged disbursement: pre-EMI, conversion, re-pricing and stopping all pres
   const stopped = stopSchedule({ existing: revised, fromDate: d(2026, 9, 1) });
   assert.equal(stopped.filter((r) => r.status === SCHEDULE_STATUS.STOPPED).length, 3);
 });
+
+// ---------------------------------------------------------------------------
+// Bank ledger exports: explicit EntryType and charge settlements
+// ---------------------------------------------------------------------------
+
+test('an explicit EntryType wins over a misleading narration', () => {
+  // "Single sided repayment of CERSAI charges" says "repayment" but the bank
+  // classifies it as a charge settlement. The ledger column is authoritative.
+  const { rows } = normaliseImportRows(`Date,Narration,Amount,EntryType
+04/02/2026,Single sided repayment of CERSAI charges,118,CHARGE_SETTLEMENT
+04/02/2026,CERSAI charges recovery,118,CHARGE
+10/03/2026,O.S. deposit transfer from linked savings account,20000,REPAYMENT_UNALLOCATED
+`);
+  assert.equal(rows[0].kind, LEDGER_KIND.CHARGE_SETTLEMENT);
+  assert.equal(rows[1].kind, LEDGER_KIND.CHARGE);
+  assert.equal(rows[2].kind, LEDGER_KIND.REPAYMENT);
+});
+
+test('a fee and its settlement cancel out and neither is a repayment', () => {
+  const r = reconcileLoanAccount({
+    loan: { originalPrincipal: 2577990 },
+    disbursements: [{ date: d(2026, 1, 31), amount: 2577990, reference: 'D1' }],
+    interestPostings: [
+      { date: d(2026, 1, 31), amount: 9912, kind: 'CHARGE', reference: 'C1' },
+      { date: d(2026, 1, 31), amount: 9912, kind: 'CHARGE_SETTLEMENT', reference: 'C2' },
+    ],
+    payments: [{ date: d(2026, 2, 10), totalAmount: 52000, principalAmount: 0, status: PAYMENT_STATUS.CONFIRMED }],
+  });
+
+  assert.equal(r.totalChargesPosted, 0, 'the fee is fully offset');
+  assert.equal(r.totalChargeSettlements, 9912);
+  assert.equal(r.totalRepaid, 52000, 'the settlement is NOT counted as a repayment');
+  // 25,77,990 + 0 + 0 - 52,000
+  assert.equal(r.bankBalance, 2525990);
+});
+
+test('the insurance loan books one Rs 100 reduction, not two', () => {
+  // The bank prints two Rs 100 descriptions on 1 March but only one moves the
+  // running balance. Importing both would overstate repayments by Rs 100 and
+  // leave the account at -99.99 instead of 0.01.
+  const onlyTheRealOne = normaliseImportRows(`Date,Narration,Amount,EntryType,Reference
+01/03/2026,Interest repayment GL to loans,100,REPAYMENT_UNALLOCATED,SBI-75022-004
+`).rows;
+  const bothOfThem = normaliseImportRows(`Date,Narration,Amount,EntryType,Reference
+01/03/2026,Interest repayment GL to loans,100,REPAYMENT_UNALLOCATED,SBI-75022-004
+01/03/2026,Compound repayment GL to loans,100,REPAYMENT_UNALLOCATED,SBI-75022-005
+`).rows;
+
+  const base = {
+    loan: { originalPrincipal: 186474 },
+    disbursements: [{ date: d(2026, 2, 3), amount: 186474, reference: 'LP-T1' }],
+    interestPostings: [{ date: d(2026, 2, 28), amount: 4798, kind: 'INTEREST', reference: 'LP-I1' }],
+  };
+  const toPayment = (row) => ({ date: row.date, totalAmount: row.amount, principalAmount: 0, status: PAYMENT_STATUS.CONFIRMED });
+
+  const correct = reconcileLoanAccount({ ...base, payments: onlyTheRealOne.map(toPayment) });
+  const doubleCounted = reconcileLoanAccount({ ...base, payments: bothOfThem.map(toPayment) });
+
+  // 1,86,474 + 4,798 - 100 = 1,91,172
+  assert.equal(correct.bankBalance, 191172);
+  assert.equal(doubleCounted.bankBalance, 191072, 'counting both would be 100 too low');
+});
+
+test('a zero-amount informational row is rejected rather than imported', () => {
+  const { rows, errors } = normaliseImportRows(`Date,Narration,Amount,EntryType
+15/10/2026,Rate changed from 7.900 percent to 8.150 percent,0.00,RATE_CHANGE
+`);
+  assert.equal(rows.length, 0);
+  assert.equal(errors.length, 1, 'a zero amount is not a transaction');
+});

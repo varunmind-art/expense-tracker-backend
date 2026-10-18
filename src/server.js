@@ -5143,6 +5143,7 @@ const serializeLoan = (loan) => ({
   disbursedPrincipal: decimalToNumber(loan.disbursedPrincipal),
   disbursementComplete: loan.disbursementComplete ?? false,
   preEmiActive: loan.preEmiActive ?? false,
+  settlementPending: loan.settlementPending ?? false,
   interestRate: decimalToNumber(loan.interestRate),
   emiAmount: decimalToNumber(loan.emiAmount),
   startDate: loan.startDate,
@@ -5448,6 +5449,7 @@ app.post(
           originalPrincipal,
           currentPrincipal,
           sanctionedLimit: input.sanctionedLimit ?? null,
+          settlementPending: input.settlementPending ?? false,
           interestRate,
           emiAmount: emiAmount ?? null,
           startDate: input.startDate ?? null,
@@ -6433,8 +6435,10 @@ app.post('/api/loans/:id/interest-postings', authenticateToken, async (req, res)
     if (Number.isNaN(date.getTime())) {
       return res.status(400).json({ error: 'Posting date is not a valid date.' });
     }
-    if (kind !== 'INTEREST' && kind !== 'CHARGE') {
-      return res.status(400).json({ error: 'Posting kind must be INTEREST or CHARGE.' });
+    if (kind !== 'INTEREST' && kind !== 'CHARGE' && kind !== 'CHARGE_SETTLEMENT') {
+      return res.status(400).json({
+        error: 'Posting kind must be INTEREST, CHARGE or CHARGE_SETTLEMENT.',
+      });
     }
 
     const reference = req.body?.reference === undefined || req.body.reference === null
@@ -6619,7 +6623,14 @@ app.post('/api/loans/:id/import/commit', authenticateToken, async (req, res) => 
             },
           });
           disbursements += 1;
-        } else if (row.kind === 'INTEREST' || row.kind === 'CHARGE') {
+        } else if (
+          row.kind === 'INTEREST' ||
+          row.kind === 'CHARGE' ||
+          // A fee offset is a CREDIT on the interest ledger, never a repayment.
+          // Booking it as a payment overstates repayments and misstates every
+          // running balance from that point on.
+          row.kind === 'CHARGE_SETTLEMENT'
+        ) {
           await db.loanInterestPosting.create({
             data: {
               loanId: loan.id,
