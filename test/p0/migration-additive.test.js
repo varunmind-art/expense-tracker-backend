@@ -106,6 +106,7 @@ test('migrations sort chronologically and tokenVersion is not the newest', () =>
   assert.deepEqual(folders.slice(index + 1), [
     '20261018052001_add_loan_disbursements_and_schedules',
     '20261018061000_add_loan_settlement_pending',
+    '20261018070000_add_loan_rate_changes',
   ]);
 });
 

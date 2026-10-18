@@ -207,6 +207,7 @@ model Loan {
   disbursements    LoanDisbursement[]
   interestPostings LoanInterestPosting[]
   emiSchedules     LoanEmiSchedule[]
+  rateChanges      LoanRateChange[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -250,6 +251,26 @@ model LoanInterestPosting {
   createdAt DateTime @default(now())
 
   @@unique([loanId, reference])
+  @@index([loanId])
+}
+
+/// A historical interest-rate change. The ORIGINAL rate is recorded as a row too,
+/// so changing `Loan.interestRate` never loses the rate the loan actually ran on.
+/// Rate changes are forward-looking by construction: they re-price projections
+/// from `effectiveDate` and never touch a stored interest posting.
+model LoanRateChange {
+  id String @id @default(cuid())
+
+  effectiveDate     DateTime
+  annualRatePercent Decimal  @db.Decimal(6, 3)
+  note              String?
+
+  loanId String
+  loan   Loan   @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([loanId, effectiveDate])
   @@index([loanId])
 }
 

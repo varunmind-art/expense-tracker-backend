@@ -787,7 +787,34 @@ const canConfirmScheduleRow = (row) => {
   return { ok: true, reason: null };
 };
 
+/**
+ * The rate in force on `asOf`, from an ordered rate history.
+ *
+ * Rate changes are forward-looking: the rate that applied on a past date is the
+ * one that governed the interest posted on that date. Nothing here rewrites a
+ * stored posting — it only answers "which rate applied then".
+ */
+const effectiveRateFrom = (rateChanges = [], asOf = null) => {
+  const rows = (rateChanges || [])
+    .filter((r) => r && r.effectiveDate !== undefined)
+    .map((r) => ({ ...r, at: startOfDay(r.effectiveDate) }))
+    .filter((r) => r.at)
+    .sort((a, b) => a.at - b.at);
+
+  if (rows.length === 0) return null;
+  const when = startOfDay(asOf);
+  if (!when) return num(rows[rows.length - 1].annualRatePercent);
+
+  let chosen = null;
+  for (const row of rows) {
+    if (row.at.getTime() <= when.getTime()) chosen = row;
+  }
+  // Before the first recorded rate there is no known rate.
+  return chosen === null ? null : num(chosen.annualRatePercent);
+};
+
 module.exports = {
+  effectiveRateFrom,
   LEDGER_KIND,
   SCHEDULE_STATUS,
   PAYMENT_STATUS,

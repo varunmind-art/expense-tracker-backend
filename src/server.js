@@ -52,9 +52,11 @@ const {
   stopSchedule,
   nextScheduledDeduction,
   canConfirmScheduleRow,
+  effectiveRateFrom,
 } = require('./lib/loanLedger');
 const {
   MAX_PERIODS,
+  roundHalfUp,
   buildAmortizationSchedule,
   computePaymentAllocation,
   outstandingBalance,
@@ -6685,6 +6687,98 @@ app.post('/api/loans/:id/import/commit', authenticateToken, async (req, res) => 
     }
     console.error('Import commit error:', error);
     res.status(500).json({ error: 'Failed to commit the import.' });
+  }
+});
+
+// ---- interest-rate history ----------------------------------------------
+//
+// A rate change is forward-looking: it re-prices projections from its effective
+// date and never touches a stored interest posting. The ORIGINAL rate is stored
+// as a row too, so setting `Loan.interestRate` to a new value cannot lose the
+// rate the loan actually ran on.
+
+app.get('/api/loans/:id/rate-changes', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    const rows = await prisma.loanRateChange.findMany({
+      where: { loanId: loan.id },
+      orderBy: { effectiveDate: 'asc' },
+    });
+
+    res.json({
+      loanId: loan.id,
+      currentRate: decimalToNumber(loan.interestRate),
+      count: rows.length,
+      rateChanges: rows.map((row) => ({
+        id: row.id,
+        loanId: row.loanId,
+        effectiveDate: row.effectiveDate,
+        annualRatePercent: decimalToNumber(row.annualRatePercent),
+        note: row.note,
+      })),
+    });
+  } catch (error) {
+    console.error('Fetch rate changes error:', error);
+    res.status(500).json({ error: 'Failed to fetch the rate history.' });
+  }
+});
+
+app.post('/api/loans/:id/rate-changes', authenticateToken, async (req, res) => {
+  try {
+    const loan = await findOwnedLoan(req.user.id, req.params.id);
+    if (!loan) return loanNotFound(res);
+
+    const rate = num(req.body?.annualRatePercent);
+    const effectiveDate = req.body?.effectiveDate === undefined
+      ? null
+      : new Date(req.body.effectiveDate);
+
+    if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
+      return res.status(400).json({ error: 'annualRatePercent must be between 0 and 100.' });
+    }
+    if (!effectiveDate || Number.isNaN(effectiveDate.getTime())) {
+      return res.status(400).json({ error: 'effectiveDate is not a valid date.' });
+    }
+
+    const created = await prisma.loanRateChange.create({
+      data: {
+        loanId: loan.id,
+        effectiveDate,
+        annualRatePercent: roundHalfUp(rate, 3),
+        note: req.body?.note ? String(req.body.note).slice(0, 500) : null,
+      },
+    });
+
+    // The loan's current rate is the rate of the LATEST recorded change.
+    const rows = await prisma.loanRateChange.findMany({
+      where: { loanId: loan.id },
+      orderBy: { effectiveDate: 'asc' },
+    });
+    const latest = rows[rows.length - 1];
+    const loan2 = await prisma.loan.update({
+      where: { id: loan.id },
+      data: { interestRate: decimalToNumber(latest.annualRatePercent) },
+    });
+
+    res.status(201).json({
+      rateChange: {
+        id: created.id,
+        loanId: created.loanId,
+        effectiveDate: created.effectiveDate,
+        annualRatePercent: decimalToNumber(created.annualRatePercent),
+        note: created.note,
+      },
+      currentRate: decimalToNumber(loan2.interestRate),
+      count: rows.length,
+    });
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      return res.status(409).json({ error: 'A rate change already exists for that effective date.' });
+    }
+    console.error('Create rate change error:', error);
+    res.status(500).json({ error: 'Failed to record the rate change.' });
   }
 });
 
