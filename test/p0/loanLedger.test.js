@@ -35,6 +35,8 @@ const {
   stopSchedule,
   nextScheduledDeduction,
   canConfirmScheduleRow,
+  summarizeLoanLedger,
+  effectiveRateFrom,
 } = require('../../src/lib/loanLedger');
 
 const d = (y, m, day) => new Date(y, m - 1, day);
@@ -588,4 +590,184 @@ test('a zero-amount informational row is rejected rather than imported', () => {
 `);
   assert.equal(rows.length, 0);
   assert.equal(errors.length, 1, 'a zero amount is not a transaction');
+});
+
+// ---------------------------------------------------------------------------
+// Dashboard summary: the two SBI loans, reconstructed from their real ledgers
+// ---------------------------------------------------------------------------
+//
+// Schedules use real monthly dates. An earlier hand-built fixture reused one
+// date for all twelve rows and made every row look past due, which is exactly
+// the class of mistake this suite exists to catch.
+
+const monthlySchedule = (start, count, amount) => {
+  const rows = [];
+  for (let i = 0; i < count; i += 1) {
+    rows.push({
+      sequence: i + 1,
+      dueDate: new Date(start.getFullYear(), start.getMonth() + i, start.getDate()),
+      amount,
+      kind: 'EMI',
+      status: SCHEDULE_STATUS.SCHEDULED,
+    });
+  }
+  return rows;
+};
+
+/**
+ * Split a total into `n` exact paise amounts. Dividing evenly introduces rounding
+ * that silently shifts the reconciled balance, which is the opposite of what this
+ * suite is for.
+ */
+const splitTotal = (total, n) => {
+  const totalPaise = Math.round(total * 100);
+  const base = Math.floor(totalPaise / n);
+  const remainder = totalPaise - base * n;
+  return Array.from({ length: n }, (_, i) => (base + (i === n - 1 ? remainder : 0)) / 100);
+};
+
+const unverifiedPayment = (date, totalAmount) => ({
+  date,
+  totalAmount,
+  principalAmount: 0,
+  interestAmount: 0,
+  allocationVerified: false,
+  status: PAYMENT_STATUS.CONFIRMED,
+});
+
+const SBI_MAIN = {
+  loan: {
+    originalPrincipal: 4491590,
+    sanctionedLimit: 7000000,
+    interestRate: 7.75,
+    emiAmount: 27801,
+    startDate: d(2026, 1, 31),
+    emiDay: 10,
+    statementAsOf: d(2026, 9, 30),
+  },
+  disbursements: [
+    { date: d(2026, 1, 31), amount: 2577990, reference: 'HL-T1' },
+    { date: d(2026, 5, 19), amount: 1913600, reference: 'HL-T2' },
+  ],
+  interestPostings: splitTotal(179401, 9).map((amount) => ({ date: d(2026, 9, 30), amount, kind: 'INTEREST' })),
+  payments: splitTotal(192000, 8).map((amount) => unverifiedPayment(d(2026, 9, 10), amount)),
+  emiSchedules: monthlySchedule(d(2026, 10, 10), 12, 20000),
+  asOf: d(2026, 10, 18),
+};
+
+const SBI_INSURANCE = {
+  loan: {
+    originalPrincipal: 186474,
+    sanctionedLimit: 580100,
+    interestRate: 8.15,
+    startDate: d(2026, 2, 3),
+    emiDay: 10,
+    settlementPending: true,
+    statementAsOf: d(2026, 10, 18),
+  },
+  disbursements: [{ date: d(2026, 2, 3), amount: 186474, reference: 'LP-T1' }],
+  interestPostings: splitTotal(4798, 8).map((amount) => ({ date: d(2026, 9, 30), amount, kind: 'INTEREST' })),
+  payments: splitTotal(191271.99, 14).map((amount) => unverifiedPayment(d(2026, 10, 14), amount)),
+  emiSchedules: [],
+  asOf: d(2026, 10, 18),
+};
+
+test('SBI main loan: bank balance is reported with its statement date, principal is not', () => {
+  const s = summarizeLoanLedger(SBI_MAIN.loan, SBI_MAIN);
+
+  assert.equal(s.bankBalance, 4478991);
+  assert.equal(s.bankBalanceAsOf.getFullYear(), 2026);
+  assert.equal(s.bankBalanceAsOf.getMonth(), 8); // September
+  assert.equal(s.bankBalanceAsOf.getDate(), 30);
+
+  // The bank never disclosed a principal/interest split, so principal is withheld.
+  assert.equal(s.allocationPending, true);
+  assert.equal(s.outstandingPrincipal, null);
+  assert.equal(s.progressPercent, null);
+  assert.equal(s.unverifiedAllocationCount, 8);
+  // ...and the bank balance is NOT substituted for it.
+  assert.notEqual(s.outstandingPrincipal, s.bankBalance);
+});
+
+test('SBI main loan: overdue comes from the real schedule, not a synthetic timeline', () => {
+  const s = summarizeLoanLedger(SBI_MAIN.loan, SBI_MAIN);
+
+  // The old logic invented a February 2026 instalment. There is none.
+  assert.equal(s.overdueInstallments, 0);
+  assert.equal(s.scheduledCount, 12);
+  assert.equal(s.confirmedScheduledCount, 0);
+  // Exactly one scheduled row (10 Oct) has fallen due and is unconfirmed.
+  assert.equal(s.scheduledAwaitingConfirmation, 1);
+  assert.equal(s.nextScheduledDueDate.getMonth(), 9); // October
+  assert.equal(s.nextScheduledDueDate.getDate(), 10);
+  assert.equal(s.nextDueDate.getTime(), s.nextScheduledDueDate.getTime());
+});
+
+test('SBI main loan: tenure and payoff are withheld because the arrangement is unknown', () => {
+  const s = summarizeLoanLedger(SBI_MAIN.loan, SBI_MAIN);
+  assert.equal(s.projectionUnavailable, true);
+  assert.equal(s.remainingMonths, null);
+  assert.equal(s.estimatedPayoffDate, null);
+  assert.ok(s.projectionUnavailableReason && s.projectionUnavailableReason.length > 20);
+  // Interest POSTED is separate from interest PAID.
+  assert.equal(s.totalInterestPosted, 179401);
+  assert.equal(s.totalInterestPaid, 0);
+});
+
+test('SBI insurance loan: settlement pending, no overdue and no invented next EMI', () => {
+  const s = summarizeLoanLedger(SBI_INSURANCE.loan, SBI_INSURANCE);
+
+  assert.equal(s.status, 'SETTLEMENT_PENDING');
+  assert.equal(s.bankBalance, 0.01);
+  assert.equal(s.bankBalanceAsOf.getMonth(), 9); // October
+  assert.equal(s.bankBalanceAsOf.getDate(), 18);
+
+  assert.equal(s.overdueInstallments, 0);
+  assert.equal(s.nextDueDate, null);
+  assert.equal(s.nextScheduledDueDate, null);
+  assert.equal(s.scheduledAwaitingConfirmation, 0);
+  assert.equal(s.hasSchedule, false);
+  assert.equal(s.remainingMonths, null);
+  assert.equal(s.estimatedPayoffDate, null);
+  // History is intact.
+  assert.equal(s.paymentCount, 14);
+  assert.equal(s.totalRepaid, 191271.99);
+});
+
+test('a settlement-pending loan is never treated as an ongoing EMI loan', () => {
+  const s = summarizeLoanLedger(SBI_INSURANCE.loan, SBI_INSURANCE);
+  assert.equal(s.status, 'SETTLEMENT_PENDING');
+  assert.equal(s.isClosed, true);
+  assert.notEqual(s.status, 'ACTIVE');
+
+  // Without settlementPending the same ledger would read as closed by balance,
+  // never as active.
+  const withoutFlag = summarizeLoanLedger({ ...SBI_INSURANCE.loan, settlementPending: false }, SBI_INSURANCE);
+  assert.equal(withoutFlag.status, 'CLOSED');
+});
+
+test('a verified loan is unaffected by any of this', () => {
+  const s = summarizeLoanLedger(
+    {
+      originalPrincipal: 1000000,
+      currentPrincipal: 1000000,
+      interestRate: 8.5,
+      emiAmount: 8678.24,
+      startDate: d(2026, 0, 1),
+      emiDay: 5,
+    },
+    {
+      payments: [
+        { date: d(2026, 1, 5), totalAmount: 8678.24, principalAmount: 1594.91, interestAmount: 7083.33, allocationVerified: true, status: PAYMENT_STATUS.CONFIRMED },
+      ],
+      asOf: d(2026, 1, 5),
+    }
+  );
+  assert.equal(s.allocationPending, false);
+  assert.equal(s.outstandingPrincipal, 998405.09);
+  assert.ok(s.progressPercent > 0);
+  assert.equal(s.status, 'ACTIVE');
+  // No schedule, so the contractual fallback still supplies a next due date.
+  assert.ok(s.nextDueDate instanceof Date);
+  assert.equal(s.overdueInstallments, 0);
 });

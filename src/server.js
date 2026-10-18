@@ -53,6 +53,7 @@ const {
   nextScheduledDeduction,
   canConfirmScheduleRow,
   effectiveRateFrom,
+  summarizeLoanLedger,
 } = require('./lib/loanLedger');
 const {
   MAX_PERIODS,
@@ -5146,6 +5147,7 @@ const serializeLoan = (loan) => ({
   disbursementComplete: loan.disbursementComplete ?? false,
   preEmiActive: loan.preEmiActive ?? false,
   settlementPending: loan.settlementPending ?? false,
+  statementAsOf: loan.statementAsOf ?? null,
   interestRate: decimalToNumber(loan.interestRate),
   emiAmount: decimalToNumber(loan.emiAmount),
   startDate: loan.startDate,
@@ -5358,7 +5360,12 @@ app.get(
       const loans = await prisma.loan.findMany({
         where: { userId: req.user.id },
         orderBy: [{ isActive: 'desc' }, { createdAt: 'desc' }],
-        include: { payments: { orderBy: [{ date: 'asc' }, { createdAt: 'asc' }] } },
+        include: {
+          payments: { orderBy: [{ date: 'asc' }, { createdAt: 'asc' }] },
+          disbursements: { orderBy: [{ date: 'asc' }] },
+          interestPostings: { orderBy: [{ date: 'asc' }] },
+          emiSchedules: { orderBy: { sequence: 'asc' } },
+        },
       });
 
       const activeFilter = req.query.active;
@@ -5368,7 +5375,12 @@ app.get(
 
       res.json(
         filtered.map((loan) => {
-          const summary = summarizeLoan(loan, loan.payments);
+          const summary = summarizeLoanLedger(loan, {
+            payments: loan.payments,
+            disbursements: loan.disbursements,
+            interestPostings: loan.interestPostings,
+            emiSchedules: loan.emiSchedules,
+          });
           return {
             ...serializeLoan(loan),
             summary,
@@ -5460,6 +5472,7 @@ app.post(
           currentPrincipal,
           sanctionedLimit: input.sanctionedLimit ?? null,
           settlementPending: input.settlementPending ?? false,
+          statementAsOf: input.statementAsOf ?? null,
           interestRate,
           emiAmount: emiAmount ?? null,
           startDate: input.startDate ?? null,
@@ -5471,7 +5484,7 @@ app.post(
         },
       });
 
-      const createdSummary = summarizeLoan(loan, []);
+      const createdSummary = summarizeLoanLedger(loan, { payments: [] });
 
       res.status(201).json({
         ...serializeLoan(loan),
@@ -5492,16 +5505,22 @@ app.get(
   authenticateToken,
   async (req, res) => {
     try {
-      const context = await loadLoanContext(req.user.id, req.params.id);
+      const context = await loadLoanLedgerContext(req.user.id, req.params.id);
       if (!context) return loanNotFound(res);
 
       const { loan, payments } = context;
-      const detailSummary = summarizeLoan(loan, payments);
+      const detailSummary = summarizeLoanLedger(loan, {
+        payments,
+        disbursements: context.disbursements,
+        interestPostings: context.interestPostings,
+        emiSchedules: context.emiSchedules,
+      });
 
       res.json({
         ...serializeLoan(loan),
         summary: detailSummary,
         nextEmiDate: detailSummary.nextDueDate,
+        nextScheduledDueDate: detailSummary.nextScheduledDueDate,
         payments: payments.map(serializePayment),
       });
     } catch (error) {
@@ -5583,7 +5602,12 @@ app.put(
       }
 
       const loan = await prisma.loan.update({ where: { id: existing.id }, data: updates });
-      const updatedSummary = summarizeLoan(loan, payments);
+      const updatedSummary = summarizeLoanLedger(loan, {
+        payments,
+        disbursements: await prisma.loanDisbursement.findMany({ where: { loanId: loan.id } }),
+        interestPostings: await prisma.loanInterestPosting.findMany({ where: { loanId: loan.id } }),
+        emiSchedules: await prisma.loanEmiSchedule.findMany({ where: { loanId: loan.id } }),
+      });
 
       res.json({
         ...serializeLoan(loan),
@@ -5959,11 +5983,16 @@ app.get(
   authenticateToken,
   async (req, res) => {
     try {
-      const context = await loadLoanContext(req.user.id, req.params.id);
+      const context = await loadLoanLedgerContext(req.user.id, req.params.id);
       if (!context) return loanNotFound(res);
 
       const { loan, payments } = context;
-      const summary = summarizeLoan(loan, payments);
+      const summary = summarizeLoanLedger(loan, {
+        payments,
+        disbursements: context.disbursements,
+        interestPostings: context.interestPostings,
+        emiSchedules: context.emiSchedules,
+      });
 
       res.json({
         ...summary,

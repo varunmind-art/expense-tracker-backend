@@ -187,6 +187,10 @@ model Loan {
   // This records that state without pretending the account is closed.
   settlementPending Boolean @default(false)
 
+  // The date the bank's balance was read. A reconciled balance is meaningless
+  // without it, and it must never be presented as a live "current" figure.
+  statementAsOf DateTime?
+
   interestRate Decimal? @db.Decimal(6, 3)
   emiAmount    Decimal? @db.Decimal(14, 2)
 

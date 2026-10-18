@@ -26,6 +26,7 @@
  */
 
 const {
+  summarizeLoan,
   toPaise,
   fromPaise,
   num,
@@ -813,7 +814,178 @@ const effectiveRateFrom = (rateChanges = [], asOf = null) => {
   return chosen === null ? null : num(chosen.annualRatePercent);
 };
 
+// ---------------------------------------------------------------------------
+// the ONE loan summary the dashboards read
+// ---------------------------------------------------------------------------
+
+const LOAN_STATUS = {
+  ACTIVE: 'ACTIVE',
+  SETTLEMENT_PENDING: 'SETTLEMENT_PENDING',
+  CLOSED: 'CLOSED',
+  PAUSED: 'PAUSED',
+};
+
+const inr = (value) =>
+  '₹' + Number(value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/**
+ * Combine the contractual summary with the reconciled ledger and the REAL
+ * deduction schedule.
+ *
+ * Three corrections over `summarizeLoan` alone:
+ *
+ *  1. Outstanding principal is not reported as a number when the bank never
+ *     disclosed a principal/interest split. Reporting "disbursed" as outstanding
+ *     with 0% repaid looks verified when it is not; it becomes null and the UI
+ *     says the allocation is pending. The reconciled BANK balance is a different
+ *     quantity and is reported separately, always with the date it was stated.
+ *
+ *  2. Overdue instalments come from `LoanEmiSchedule` rows, never from a
+ *     synthetic timeline. An unconfirmed scheduled deduction is reported as
+ *     "awaiting confirmation", not as a bank failure, and a loan with no
+ *     schedule at all has no overdue instalments and no next EMI.
+ *
+ *  3. Tenure and payoff are withheld when a valid projection is impossible.
+ */
+const summarizeLoanLedger = (
+  loan = {},
+  { payments = [], disbursements = [], interestPostings = [], emiSchedules = [], asOf = null } = {}
+) => {
+  const base = summarizeLoan(loan, payments, { asOf });
+  const counted = (payments || []).filter(Boolean).filter(isCountedPayment);
+
+  const unverified = counted.filter((p) => p.allocationVerified === false);
+  const allocationPending = unverified.length > 0;
+
+  // ---- which date is the balance stated as of? ----------------------------
+  const ledgerDates = [];
+  const note = (value) => {
+    const d = startOfDay(value);
+    if (d) ledgerDates.push(d.getTime());
+  };
+  for (const r of disbursements || []) note(r.date);
+  for (const r of interestPostings || []) note(r.date);
+  for (const p of counted) note(p.date);
+  const lastLedgerDate = ledgerDates.length ? new Date(Math.max(...ledgerDates)) : null;
+
+  // A stated statement date wins; otherwise the last ledger row. Never "now".
+  const statementAsOf = startOfDay(loan.statementAsOf) || lastLedgerDate;
+
+  const ledger = reconcileLoanAccount({
+    loan,
+    disbursements,
+    interestPostings,
+    payments,
+    asOf: statementAsOf,
+  });
+
+  // ---- the real deduction schedule is the only authority on overdue ------
+  const rows = (emiSchedules || []).filter(Boolean);
+  const statusOf = (r) => String(r.status || '').toUpperCase();
+  const scheduled = rows
+    .filter((r) => statusOf(r) === 'SCHEDULED')
+    .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+  const confirmedRows = rows.filter((r) => statusOf(r) === 'CONFIRMED');
+  const hasSchedule = rows.length > 0;
+
+  const today = startOfDay(asOf) || startOfDay(new Date());
+  const awaiting = scheduled.filter((r) => {
+    const due = startOfDay(r.dueDate);
+    return due && due.getTime() <= today.getTime();
+  });
+  const nextScheduled = scheduled.length > 0 ? scheduled[0] : null;
+
+  const settlementPending = loan.settlementPending === true;
+
+  // ---- can a projection be trusted at all? -------------------------------
+  const emi = num(loan.emiAmount);
+  const scheduledAmount = scheduled.length > 0 ? num(scheduled[0].amount) : null;
+  const emiMismatch =
+    scheduledAmount !== null &&
+    emi > 0 &&
+    Math.abs(toPaise(scheduledAmount) - toPaise(emi)) > 100;
+
+  let projectionUnavailable = false;
+  let projectionUnavailableReason = null;
+
+  if (settlementPending) {
+    projectionUnavailable = true;
+    projectionUnavailableReason =
+      'The loan is repaid and settlement is pending formal bank closure, so no future instalments are projected.';
+  } else if (allocationPending) {
+    projectionUnavailable = true;
+    projectionUnavailableReason =
+      'The bank did not disclose a principal/interest split, so outstanding principal and tenure cannot be projected from this ledger.';
+  } else if (emiMismatch) {
+    projectionUnavailable = true;
+    projectionUnavailableReason =
+      `The observed deduction (${inr(scheduledAmount)}) differs from the contractual EMI (${inr(emi)}) ` +
+      'and the bank has not confirmed a revised tenure, so tenure and payoff cannot be projected.';
+  }
+
+  const fullyRepaid = ledger.totalRepaid > 0 && ledger.bankBalance <= 0.01;
+  const status = settlementPending
+    ? LOAN_STATUS.SETTLEMENT_PENDING
+    : fullyRepaid
+      ? LOAN_STATUS.CLOSED
+      : loan.isActive === false
+        ? LOAN_STATUS.PAUSED
+        : LOAN_STATUS.ACTIVE;
+
+  return {
+    ...base,
+
+    // ---- reconciled ledger, always with its as-of date ----
+    bankBalance: ledger.bankBalance,
+    bankBalanceAsOf: statementAsOf,
+    totalDisbursed: ledger.disbursedPrincipal,
+    sanctionedLimit: ledger.sanctionedLimit,
+    undrawnLimit: ledger.undrawnLimit,
+    totalInterestPosted: ledger.totalInterestPosted,
+    totalChargesPosted: ledger.totalChargesPosted,
+    totalChargeSettlements: ledger.totalChargeSettlements,
+    totalRepaid: ledger.totalRepaid,
+    // Interest POSTED by the bank is not the same as interest PAID by the borrower.
+    totalInterestPaid: base.totalInterestPaid,
+
+    // ---- allocation honesty ----
+    allocationPending,
+    unverifiedAllocationCount: unverified.length,
+    outstandingPrincipal: allocationPending ? null : base.outstandingPrincipal,
+    principalRepaid: allocationPending ? null : base.principalRepaid,
+    progressPercent: allocationPending ? null : base.progressPercent,
+
+    // ---- real schedule, not a synthetic timeline ----
+    hasSchedule,
+    scheduledCount: scheduled.length,
+    confirmedScheduledCount: confirmedRows.length,
+    nextScheduledDueDate: settlementPending || !nextScheduled ? null : nextScheduled.dueDate,
+    nextScheduledAmount: settlementPending || !nextScheduled ? null : num(nextScheduled.amount),
+    scheduledAwaitingConfirmation: settlementPending ? 0 : awaiting.length,
+    overdueInstallments: hasSchedule || settlementPending ? 0 : base.overdueInstallments,
+    nextDueDate: settlementPending
+      ? null
+      : hasSchedule
+        ? nextScheduled
+          ? nextScheduled.dueDate
+          : null
+        : base.nextDueDate,
+
+    // ---- projections ----
+    projectionUnavailable,
+    projectionUnavailableReason,
+    remainingMonths: projectionUnavailable ? null : base.remainingMonths,
+    remainingInstallments: projectionUnavailable ? null : base.remainingInstallments,
+    estimatedPayoffDate: projectionUnavailable ? null : base.estimatedPayoffDate,
+
+    status,
+    isClosed: settlementPending || fullyRepaid,
+  };
+};
+
 module.exports = {
+  LOAN_STATUS,
+  summarizeLoanLedger,
   effectiveRateFrom,
   LEDGER_KIND,
   SCHEDULE_STATUS,

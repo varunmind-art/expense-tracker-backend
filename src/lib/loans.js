@@ -1214,6 +1214,12 @@ const validateLoanInput = (body = {}, { requireAll = true } = {}) => {
     value.settlementPending = Boolean(body.settlementPending);
   }
 
+  if (has('statementAsOf')) {
+    const parsed = asDate(body.statementAsOf);
+    if (!parsed) errors.push('statementAsOf is not a valid date.');
+    else value.statementAsOf = parsed;
+  }
+
   // An explicit instalment count is accepted as an input convenience and is
   // mapped onto an end date by the routes. It is NOT a stored column, so it is
   // always stripped before a Prisma write.
