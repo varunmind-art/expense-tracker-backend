@@ -62,8 +62,15 @@ model Expense {
   accountId   String?
   account     Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
 
+  // Provenance for records created outside the web form (e.g. the Android app).
+  // `externalRef` is the client's idempotency key, unique per user and source.
+  source      String?
+  externalRef String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@unique([userId, source, externalRef])
 }
 
 model Budget {

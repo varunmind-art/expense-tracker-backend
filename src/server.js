@@ -846,7 +846,35 @@ app.post(
         isRecurring,
         type,
         accountId,
+        source,
+        externalRef,
       } = req.body;
+
+      // Idempotency: a client (the Android app) may supply an externalRef scoped
+      // to a source. The same pair is only ever stored once per user.
+      //
+      // Over-long values are rejected rather than truncated: truncating could fold
+      // two different transactions onto the same key and refuse a legitimate one.
+      if (
+        (source !== undefined && source !== null && typeof source !== 'string') ||
+        (externalRef !== undefined && externalRef !== null && typeof externalRef !== 'string')
+      ) {
+        return res.status(400).json({
+          error: 'source and externalRef must be strings.',
+        });
+      }
+
+      const rawSource = typeof source === 'string' ? source.trim() : '';
+      const rawRef = typeof externalRef === 'string' ? externalRef.trim() : '';
+
+      if (rawSource.length > 32 || rawRef.length > 200) {
+        return res.status(400).json({
+          error: 'source or externalRef is too long.',
+        });
+      }
+
+      const normSource = rawSource === '' ? null : rawSource.toUpperCase();
+      const normExternalRef = rawRef === '' ? null : rawRef;
 
       // P0-8: the category must belong to the authenticated user. A foreign id
       // and a nonexistent one both yield the same 400, so the response cannot be
@@ -910,6 +938,8 @@ app.post(
             categoryId,
             accountId:
               accountId || null,
+            source: normSource,
+            externalRef: normExternalRef,
           },
           include: {
             category: true,
@@ -926,6 +956,15 @@ app.post(
 
       res.status(201).json(expense);
     } catch (error) {
+      // A repeated share of the same receipt is not an error the client should
+      // retry: report it as an existing record.
+      if (error && error.code === 'P2002') {
+        return res.status(409).json({
+          error: 'This transaction has already been recorded.',
+          code: 'DUPLICATE_EXTERNAL_REF',
+        });
+      }
+
       console.error(error);
 
       res.status(500).json({
